@@ -22,11 +22,12 @@ use crate::storage::Storage;
 ///
 /// # Safety
 ///
-/// Implementing this trait asserts that the type is `Copy`, has no padding
-/// bytes, and that **every** bit pattern is a valid value — so reinterpreting
-/// arbitrary bytes as `Self` can never produce an invalid value. This holds for
-/// the integer and floating-point primitives, but not for types with invalid
-/// bit patterns such as `bool` or `char`.
+/// Implementing this trait asserts that the type is `Copy`, has a non-zero
+/// size, has no padding bytes, and that **every** bit pattern is a valid value
+/// — so reinterpreting arbitrary bytes as `Self` can never produce an invalid
+/// value. This holds for the integer and floating-point primitives, but not
+/// for types with invalid bit patterns such as `bool` or `char`, nor for
+/// zero-sized types.
 pub unsafe trait Element: Copy {}
 
 macro_rules! impl_element {
@@ -166,6 +167,25 @@ impl<'a, T: Element> View<'a, T> {
         };
         Ok(Self { data })
     }
+
+    /// Consumes the view, returning the underlying slice for the storage's
+    /// full borrow lifetime `'a` (longer than a `Deref` borrow of the view).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::storage::Storage;
+    /// use datalab::view::View;
+    ///
+    /// let storage = Storage::from_elements(&[1u32, 2]);
+    /// let slice: &[u32] = View::<u32>::new(&storage).unwrap().into_slice();
+    /// assert_eq!(slice, &[1, 2]);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn into_slice(self) -> &'a [T] {
+        self.data
+    }
 }
 
 impl<T: Element> Deref for View<'_, T> {
@@ -222,6 +242,26 @@ impl<'a, T: Element> ViewMut<'a, T> {
             unsafe { slice::from_raw_parts_mut(ptr, len) }
         };
         Ok(Self { data })
+    }
+
+    /// Consumes the view, returning the underlying mutable slice for the
+    /// storage's full borrow lifetime `'a`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::storage::Storage;
+    /// use datalab::view::ViewMut;
+    ///
+    /// let mut storage = Storage::from_elements(&[1u32, 2]);
+    /// let slice: &mut [u32] = ViewMut::<u32>::new(&mut storage).unwrap().into_slice_mut();
+    /// slice[0] = 9;
+    /// assert_eq!(slice, &[9, 2]);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn into_slice_mut(self) -> &'a mut [T] {
+        self.data
     }
 }
 

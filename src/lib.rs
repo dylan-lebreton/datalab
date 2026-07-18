@@ -10,4 +10,5 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod storage;
+pub mod tensor;
 pub mod view;
