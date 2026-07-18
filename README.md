@@ -177,9 +177,9 @@ minimal.
 ## Roadmap
 
 - [x] Project setup, dual license, first crates.io release (name reserved)
-- [x] `Storage` — contiguous byte storage (RAM-backed)
-- [ ] `View` — typed interpretation of bytes
-- [ ] Aligned / pluggable backing store (mmap, spill)
+- [x] `Storage` — aligned, contiguous byte storage (RAM-backed)
+- [x] `View` / `ViewMut` — typed, zero-copy interpretation of bytes
+- [ ] Pluggable backing store (mmap, spill-to-disk)
 - [ ] 1-D out-of-core tensor + chunked streaming
 - [ ] N-D tensor (the first frontend)
 - [ ] Streaming engine (bounded-memory operators)
@@ -220,8 +220,9 @@ public item carries a runnable `# Examples` doctest. The public API follows the
 [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
 
 **Quality bar.** Code must pass `cargo test` (including doctests) and
-`cargo clippy` with no warnings before being committed. `unsafe` is confined,
-justified, wrapped in a safe API, and checked with [Miri](https://github.com/rust-lang/miri).
+`cargo clippy --all-targets` with no warnings before being committed. `unsafe`
+is confined, justified with a `// SAFETY:` comment (enforced by lint), wrapped
+in a safe API, and checked with [Miri](https://github.com/rust-lang/miri).
 
 ## License
 
