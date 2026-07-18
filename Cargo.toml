@@ -1,0 +1,12 @@
+[package]
+name = "datalab"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+
+# Optimizations applied in `--release` (build, test --release, bench).
+[profile.release]
+lto = "fat"          # link-time optimization across all crates
+codegen-units = 1    # slower compile, better optimization
