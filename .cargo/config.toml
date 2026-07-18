@@ -1,0 +1,11 @@
+# Local build configuration.
+#
+# `target-cpu=native` lets the compiler use the full instruction set of the
+# machine that builds the code (e.g. Apple Silicon NEON), instead of a portable
+# baseline. This maximizes performance for local development and benchmarking.
+#
+# Trade-off: the produced binaries are NOT portable to other CPU architectures.
+# This is fine here — datalab is a library, so downstream users compile it
+# themselves with their own settings; this only affects local builds/benches.
+[build]
+rustflags = ["-C", "target-cpu=native"]
