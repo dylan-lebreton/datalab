@@ -14,7 +14,6 @@
 use std::error::Error;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
 use std::slice;
 
 use crate::storage::Storage;
@@ -41,6 +40,34 @@ macro_rules! impl_element {
 }
 
 impl_element!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
+
+impl Storage {
+    /// Creates a storage holding a copy of `elements`, laid out contiguously
+    /// with the default alignment.
+    ///
+    /// This is the typed counterpart of [`Storage::from_bytes`]: the resulting
+    /// storage is always viewable as `[T]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::storage::Storage;
+    /// use datalab::view::View;
+    ///
+    /// let storage = Storage::from_elements(&[1.5f64, -2.0]);
+    /// let view = View::<f64>::new(&storage).unwrap();
+    /// assert_eq!(&*view, &[1.5, -2.0]);
+    /// ```
+    #[must_use]
+    pub fn from_elements<T: Element>(elements: &[T]) -> Self {
+        // SAFETY: `T: Element` guarantees no padding, so every byte of the
+        // slice is initialized; `u8` has alignment 1, and the length in bytes
+        // of an existing slice cannot overflow `isize`.
+        let bytes =
+            unsafe { slice::from_raw_parts(elements.as_ptr().cast::<u8>(), size_of_val(elements)) };
+        Self::from_bytes(bytes)
+    }
+}
 
 /// The reason a typed view could not be created over a [`Storage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +140,7 @@ fn checked_len<T: Element>(bytes: &[u8]) -> Result<usize, ViewError> {
 /// assert_eq!(view.len(), 2);
 /// assert_eq!(view[0], 0.0);
 /// ```
+#[derive(Clone, Copy)]
 pub struct View<'a, T: Element> {
     data: &'a [T],
 }
@@ -128,9 +156,7 @@ impl<'a, T: Element> View<'a, T> {
         let bytes = storage.as_bytes();
         let len = checked_len::<T>(bytes)?;
         let data = if len == 0 {
-            // SAFETY: an aligned, non-null dangling pointer is a valid base for
-            // a zero-length slice.
-            unsafe { slice::from_raw_parts(NonNull::<T>::dangling().as_ptr(), 0) }
+            &[]
         } else {
             // SAFETY: `checked_len` verified the length is a multiple of the
             // element size and the base pointer is aligned for `T`; `T: Element`
@@ -145,6 +171,7 @@ impl<'a, T: Element> View<'a, T> {
 impl<T: Element> Deref for View<'_, T> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &[T] {
         self.data
     }
@@ -186,9 +213,7 @@ impl<'a, T: Element> ViewMut<'a, T> {
     pub fn new(storage: &'a mut Storage) -> Result<Self, ViewError> {
         let len = checked_len::<T>(storage.as_bytes())?;
         let data = if len == 0 {
-            // SAFETY: an aligned, non-null dangling pointer is a valid base for
-            // a zero-length slice.
-            unsafe { slice::from_raw_parts_mut(NonNull::<T>::dangling().as_ptr(), 0) }
+            &mut []
         } else {
             let ptr = storage.as_bytes_mut().as_mut_ptr().cast::<T>();
             // SAFETY: `checked_len` verified length and alignment; `T: Element`
@@ -203,12 +228,14 @@ impl<'a, T: Element> ViewMut<'a, T> {
 impl<T: Element> Deref for ViewMut<'_, T> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &[T] {
         self.data
     }
 }
 
 impl<T: Element> DerefMut for ViewMut<'_, T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         self.data
     }
@@ -284,6 +311,28 @@ mod tests {
         let view = View::<f64>::new(&storage).unwrap();
         assert!(view.is_empty());
         assert_eq!(view.len(), 0);
+    }
+
+    #[test]
+    fn from_elements_roundtrips_through_a_view() {
+        let storage = Storage::from_elements(&[1i32, -2, 3]);
+        assert_eq!(storage.len(), 3 * size_of::<i32>());
+        let view = View::<i32>::new(&storage).unwrap();
+        assert_eq!(&*view, &[1, -2, 3]);
+    }
+
+    #[test]
+    fn from_elements_of_empty_slice_is_empty() {
+        let storage = Storage::from_elements::<f64>(&[]);
+        assert!(storage.is_empty());
+    }
+
+    #[test]
+    fn view_is_copyable() {
+        let storage = Storage::from_elements(&[1u8, 2]);
+        let view = View::<u8>::new(&storage).unwrap();
+        let copy = view;
+        assert_eq!(&*view, &*copy);
     }
 
     #[test]
