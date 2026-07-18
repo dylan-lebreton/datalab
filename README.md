@@ -179,10 +179,12 @@ minimal.
 - [x] Project setup, dual license, first crates.io release (name reserved)
 - [x] `Storage` — aligned, contiguous byte storage (RAM-backed)
 - [x] `View` / `ViewMut` — typed, zero-copy interpretation of bytes
+- [x] `Tensor` — owned, contiguous, typed 1-D tensor
+- [ ] Element-wise kernels + benchmarks (criterion)
 - [ ] Pluggable backing store (mmap, spill-to-disk)
-- [ ] 1-D out-of-core tensor + chunked streaming
-- [ ] N-D tensor (the first frontend)
-- [ ] Streaming engine (bounded-memory operators)
+- [ ] Streaming engine — bounded-memory operators over batches, lazy API
+      (`LazyTensor`: `collect`, `sink`)
+- [ ] N-D tensor (shape/strides)
 - [ ] Trees as views over index tensors
 - [ ] Additional frontends (DataFrame, Geo) and Arrow interop
 
