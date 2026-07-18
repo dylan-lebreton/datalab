@@ -3,6 +3,11 @@ name = "datalab"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
+description = "Highly-optimized, streaming-capable data structures for Rust (trees, tensors, and more)."
+repository = "https://github.com/dylan-lebreton/datalab"
+readme = "README.md"
+keywords = ["data-structures", "streaming", "out-of-core", "tensor", "tree"]
+categories = ["data-structures", "science"]
 
 [dependencies]
 
