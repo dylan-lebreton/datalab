@@ -367,10 +367,11 @@ mod tests {
 
     #[test]
     fn storage_align_covers_every_scalar() {
-        assert!(STORAGE_ALIGN.is_power_of_two());
-        assert!(STORAGE_ALIGN >= 64);
-        assert!(STORAGE_ALIGN >= std::mem::align_of::<u64>());
-        assert!(STORAGE_ALIGN >= std::mem::align_of::<f64>());
-        assert!(STORAGE_ALIGN >= std::mem::align_of::<u128>());
+        // Compile-time contract: the default alignment covers every scalar.
+        const { assert!(STORAGE_ALIGN.is_power_of_two()) };
+        const { assert!(STORAGE_ALIGN >= 64) };
+        const { assert!(STORAGE_ALIGN >= align_of::<u64>()) };
+        const { assert!(STORAGE_ALIGN >= align_of::<f64>()) };
+        const { assert!(STORAGE_ALIGN >= align_of::<u128>()) };
     }
 }
