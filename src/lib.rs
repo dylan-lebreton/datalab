@@ -3,6 +3,8 @@
 //! Highly-optimized, streaming-capable data structures for Rust
 //! (trees, tensors, stacks, and more).
 //!
-//! **Status:** early development — the public API is not available yet.
+//! **Status:** early development — the public API is not stable yet.
 
-// Implementation coming soon.
+#![deny(missing_docs)]
+
+pub mod storage;
