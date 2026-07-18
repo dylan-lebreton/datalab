@@ -6,6 +6,8 @@
 //! **Status:** early development — the public API is not stable yet.
 
 #![deny(missing_docs)]
+#![warn(missing_debug_implementations)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod storage;
 pub mod view;

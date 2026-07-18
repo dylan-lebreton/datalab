@@ -23,13 +23,14 @@ use std::slice;
 /// Default alignment, in bytes, of a [`Storage`] allocated with
 /// [`Storage::zeroed`].
 ///
-/// This is always **at least 64** (enough for every scalar we store and for
-/// wide SIMD registers). On `aarch64` (e.g. Apple Silicon) it is 128, matching
-/// the cache-line size to avoid false sharing between neighbouring buffers.
+/// This is always **at least 64**: enough for every scalar we store, for the
+/// widest SIMD registers (AVX-512), for the x86-64 cache line, and matching
+/// the 64-byte convention used by Apache Arrow. On `aarch64` (e.g. Apple
+/// Silicon) it is 128 — the cache-line size there — so neighbouring buffers
+/// never share a line (false sharing).
 ///
 /// The value is chosen at compile time from the target architecture, so it
-/// adapts automatically to the machine without any user action. The table
-/// mirrors the one maintained by `crossbeam-utils`' `CachePadded`.
+/// adapts automatically to the machine without any user action.
 pub const STORAGE_ALIGN: usize = if cfg!(target_arch = "aarch64") {
     128
 } else {
@@ -62,10 +63,12 @@ pub struct Storage {
     align: usize,
 }
 
-// SAFETY: `Storage` uniquely owns its heap allocation and exposes no interior
-// mutability, so — exactly like `Vec<u8>` — it is safe to move it across
-// threads and to share `&Storage` between threads.
+// SAFETY: `Storage` uniquely owns its heap allocation and has no interior
+// mutability, so — exactly like `Vec<u8>` — moving it to another thread is safe.
 unsafe impl Send for Storage {}
+
+// SAFETY: `&Storage` only permits reads and there is no interior mutability,
+// so sharing references across threads is safe.
 unsafe impl Sync for Storage {}
 
 impl Storage {
@@ -80,6 +83,7 @@ impl Storage {
     /// let storage = Storage::zeroed(3);
     /// assert_eq!(storage.as_bytes(), &[0, 0, 0]);
     /// ```
+    #[must_use]
     pub fn zeroed(len: usize) -> Self {
         Self::zeroed_aligned(len, STORAGE_ALIGN)
     }
@@ -101,6 +105,7 @@ impl Storage {
     /// assert_eq!(storage.alignment(), 32);
     /// assert_eq!(storage.as_bytes().as_ptr() as usize % 32, 0);
     /// ```
+    #[must_use]
     pub fn zeroed_aligned(len: usize, align: usize) -> Self {
         assert!(
             align.is_power_of_two(),
@@ -138,6 +143,7 @@ impl Storage {
     /// assert_eq!(storage.len(), 3);
     /// assert_eq!(storage.as_bytes(), &[1, 2, 3]);
     /// ```
+    #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let mut storage = Self::zeroed(bytes.len());
         storage.as_bytes_mut().copy_from_slice(bytes);
@@ -153,6 +159,8 @@ impl Storage {
     ///
     /// assert_eq!(Storage::zeroed(8).len(), 8);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -167,6 +175,8 @@ impl Storage {
     /// assert!(Storage::zeroed(0).is_empty());
     /// assert!(!Storage::zeroed(1).is_empty());
     /// ```
+    #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -180,6 +190,8 @@ impl Storage {
     ///
     /// assert_eq!(Storage::zeroed(8).alignment(), STORAGE_ALIGN);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn alignment(&self) -> usize {
         self.align
     }
@@ -194,6 +206,8 @@ impl Storage {
     /// let storage = Storage::from_bytes(&[1, 2, 3]);
     /// assert_eq!(storage.as_bytes(), &[1, 2, 3]);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY: `ptr` points to `len` contiguous, initialized bytes (zeroed at
         // allocation) that stay valid and immutable for the lifetime of `&self`.
@@ -212,6 +226,8 @@ impl Storage {
     /// storage.as_bytes_mut()[0] = 7;
     /// assert_eq!(storage.as_bytes(), &[7, 0]);
     /// ```
+    #[inline]
+    #[must_use]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: `ptr` points to `len` contiguous, initialized bytes that stay
         // valid for the lifetime of `&mut self`, and `&mut self` guarantees
@@ -272,6 +288,7 @@ impl From<&[u8]> for Storage {
 }
 
 impl AsRef<[u8]> for Storage {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
