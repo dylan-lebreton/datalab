@@ -1,0 +1,297 @@
+//! Typed views over raw [`Storage`] bytes.
+//!
+//! A view is a non-owning, typed lens: it reinterprets the raw bytes of a
+//! [`Storage`] as a slice of some element type `T` (an [`Element`]), so callers
+//! can read and write numbers instead of bytes. Creating a view is checked and
+//! zero-copy: it borrows the storage and reinterprets its bytes in place.
+//!
+//! [`View`] gives read-only access; [`ViewMut`] also allows writing. Both
+//! dereference to `[T]`, so the whole slice API (indexing, iteration, `len`, …)
+//! is available.
+//!
+//! [`Storage`]: crate::storage::Storage
+
+use std::error::Error;
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
+use std::slice;
+
+use crate::storage::Storage;
+
+/// Types that can be safely reinterpreted from raw bytes.
+///
+/// # Safety
+///
+/// Implementing this trait asserts that the type is `Copy`, has no padding
+/// bytes, and that **every** bit pattern is a valid value — so reinterpreting
+/// arbitrary bytes as `Self` can never produce an invalid value. This holds for
+/// the integer and floating-point primitives, but not for types with invalid
+/// bit patterns such as `bool` or `char`.
+pub unsafe trait Element: Copy {}
+
+macro_rules! impl_element {
+    ($($t:ty),* $(,)?) => {
+        $(
+            // SAFETY: every bit pattern is a valid value for this primitive, it
+            // is `Copy`, and it has no padding.
+            unsafe impl Element for $t {}
+        )*
+    };
+}
+
+impl_element!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);
+
+/// The reason a typed view could not be created over a [`Storage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewError {
+    /// The byte length is not a whole multiple of the element size.
+    SizeMismatch {
+        /// Number of bytes held by the storage.
+        byte_len: usize,
+        /// Size, in bytes, of one element.
+        element_size: usize,
+    },
+    /// The storage is not aligned strongly enough for the element type.
+    Misaligned {
+        /// Alignment, in bytes, required by the element type.
+        required: usize,
+    },
+}
+
+impl fmt::Display for ViewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SizeMismatch {
+                byte_len,
+                element_size,
+            } => write!(
+                f,
+                "byte length {byte_len} is not a multiple of element size {element_size}"
+            ),
+            Self::Misaligned { required } => {
+                write!(f, "storage is not aligned to {required} bytes")
+            }
+        }
+    }
+}
+
+impl Error for ViewError {}
+
+/// Validates that `bytes` can be reinterpreted as `[T]` and returns the element
+/// count.
+fn checked_len<T: Element>(bytes: &[u8]) -> Result<usize, ViewError> {
+    let element_size = size_of::<T>();
+    if !bytes.len().is_multiple_of(element_size) {
+        return Err(ViewError::SizeMismatch {
+            byte_len: bytes.len(),
+            element_size,
+        });
+    }
+    // Alignment only matters when there is data to point at.
+    if !bytes.is_empty() && !(bytes.as_ptr() as usize).is_multiple_of(align_of::<T>()) {
+        return Err(ViewError::Misaligned {
+            required: align_of::<T>(),
+        });
+    }
+    Ok(bytes.len() / element_size)
+}
+
+/// An immutable, typed view over a [`Storage`]'s bytes.
+///
+/// Dereferences to `[T]`, so every slice method is available.
+///
+/// # Examples
+///
+/// ```
+/// use datalab::storage::Storage;
+/// use datalab::view::View;
+///
+/// // 16 bytes = two f64 values, zero-initialized.
+/// let storage = Storage::zeroed(16);
+/// let view = View::<f64>::new(&storage).unwrap();
+/// assert_eq!(view.len(), 2);
+/// assert_eq!(view[0], 0.0);
+/// ```
+pub struct View<'a, T: Element> {
+    data: &'a [T],
+}
+
+impl<'a, T: Element> View<'a, T> {
+    /// Creates a typed view over `storage`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ViewError`] if the storage's byte length is not a multiple of
+    /// `size_of::<T>()`, or if it is not aligned for `T`.
+    pub fn new(storage: &'a Storage) -> Result<Self, ViewError> {
+        let bytes = storage.as_bytes();
+        let len = checked_len::<T>(bytes)?;
+        let data = if len == 0 {
+            // SAFETY: an aligned, non-null dangling pointer is a valid base for
+            // a zero-length slice.
+            unsafe { slice::from_raw_parts(NonNull::<T>::dangling().as_ptr(), 0) }
+        } else {
+            // SAFETY: `checked_len` verified the length is a multiple of the
+            // element size and the base pointer is aligned for `T`; `T: Element`
+            // guarantees any bit pattern is valid; the bytes are initialized and
+            // stay valid and immutable for `'a` through the borrow of `storage`.
+            unsafe { slice::from_raw_parts(bytes.as_ptr().cast::<T>(), len) }
+        };
+        Ok(Self { data })
+    }
+}
+
+impl<T: Element> Deref for View<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.data
+    }
+}
+
+impl<T: Element + fmt::Debug> fmt::Debug for View<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.data.iter()).finish()
+    }
+}
+
+/// A mutable, typed view over a [`Storage`]'s bytes.
+///
+/// Dereferences to `[T]` (mutably too), so every slice method is available.
+///
+/// # Examples
+///
+/// ```
+/// use datalab::storage::Storage;
+/// use datalab::view::ViewMut;
+///
+/// let mut storage = Storage::zeroed(16); // two f64
+/// let mut view = ViewMut::<f64>::new(&mut storage).unwrap();
+/// view[0] = 1.5;
+/// view[1] = -2.0;
+/// assert_eq!(&*view, &[1.5, -2.0]);
+/// ```
+pub struct ViewMut<'a, T: Element> {
+    data: &'a mut [T],
+}
+
+impl<'a, T: Element> ViewMut<'a, T> {
+    /// Creates a mutable typed view over `storage`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ViewError`] if the storage's byte length is not a multiple of
+    /// `size_of::<T>()`, or if it is not aligned for `T`.
+    pub fn new(storage: &'a mut Storage) -> Result<Self, ViewError> {
+        let len = checked_len::<T>(storage.as_bytes())?;
+        let data = if len == 0 {
+            // SAFETY: an aligned, non-null dangling pointer is a valid base for
+            // a zero-length slice.
+            unsafe { slice::from_raw_parts_mut(NonNull::<T>::dangling().as_ptr(), 0) }
+        } else {
+            let ptr = storage.as_bytes_mut().as_mut_ptr().cast::<T>();
+            // SAFETY: `checked_len` verified length and alignment; `T: Element`
+            // makes any bit pattern valid; `&mut storage` guarantees exclusive
+            // access to initialized bytes for `'a`.
+            unsafe { slice::from_raw_parts_mut(ptr, len) }
+        };
+        Ok(Self { data })
+    }
+}
+
+impl<T: Element> Deref for ViewMut<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        self.data
+    }
+}
+
+impl<T: Element> DerefMut for ViewMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.data
+    }
+}
+
+impl<T: Element + fmt::Debug> fmt::Debug for ViewMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.data.iter()).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zeroed_storage_reads_as_zeros() {
+        let storage = Storage::zeroed(16);
+        let view = View::<f64>::new(&storage).unwrap();
+        assert_eq!(view.len(), 2);
+        assert_eq!(&*view, &[0.0, 0.0]);
+    }
+
+    #[test]
+    fn write_then_read_roundtrips() {
+        let mut storage = Storage::zeroed(16);
+        {
+            let mut view = ViewMut::<f64>::new(&mut storage).unwrap();
+            view[0] = 1.5;
+            view[1] = -2.0;
+        }
+        let view = View::<f64>::new(&storage).unwrap();
+        assert_eq!(&*view, &[1.5, -2.0]);
+    }
+
+    #[test]
+    fn element_count_depends_on_type_size() {
+        let storage = Storage::zeroed(12);
+        assert_eq!(View::<u8>::new(&storage).unwrap().len(), 12);
+        assert_eq!(View::<i32>::new(&storage).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn slice_api_is_available_through_deref() {
+        let mut storage = Storage::zeroed(16);
+        {
+            let mut view = ViewMut::<i32>::new(&mut storage).unwrap();
+            for (i, slot) in view.iter_mut().enumerate() {
+                *slot = i as i32;
+            }
+        }
+        let view = View::<i32>::new(&storage).unwrap();
+        assert_eq!(view.iter().sum::<i32>(), (0..4).sum::<i32>());
+        assert_eq!(view.get(2), Some(&2));
+    }
+
+    #[test]
+    fn size_mismatch_is_reported() {
+        let storage = Storage::from_bytes(&[0; 5]);
+        let err = View::<f64>::new(&storage).unwrap_err();
+        assert_eq!(
+            err,
+            ViewError::SizeMismatch {
+                byte_len: 5,
+                element_size: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_storage_yields_empty_view() {
+        let storage = Storage::zeroed(0);
+        let view = View::<f64>::new(&storage).unwrap();
+        assert!(view.is_empty());
+        assert_eq!(view.len(), 0);
+    }
+
+    #[test]
+    fn error_displays_a_message() {
+        let err = ViewError::SizeMismatch {
+            byte_len: 5,
+            element_size: 8,
+        };
+        assert!(err.to_string().contains("not a multiple"));
+    }
+}

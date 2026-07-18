@@ -8,3 +8,4 @@
 #![deny(missing_docs)]
 
 pub mod storage;
+pub mod view;
