@@ -37,7 +37,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,9 +180,12 @@ impl Storage {
 
         let backing = if len == 0 {
             // No allocation for an empty storage: a dangling (but non-null)
-            // pointer is a valid base for a zero-length slice.
+            // pointer is a valid base for a zero-length slice. It is placed
+            // at address `align` so the pointer really carries the alignment
+            // `alignment()` reports, even with nothing to point at.
             Backing::Heap {
-                ptr: NonNull::dangling(),
+                ptr: NonNull::new(ptr::without_provenance_mut(align))
+                    .expect("align is a non-zero power of two"),
                 len: 0,
                 align,
             }
@@ -217,7 +220,32 @@ impl Storage {
     /// ```
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let mut storage = Self::zeroed(bytes.len());
+        Self::from_bytes_aligned(bytes, STORAGE_ALIGN)
+    }
+
+    /// Creates a storage holding a copy of `bytes` with a caller-chosen
+    /// `align`.
+    ///
+    /// This is the copying counterpart of [`Storage::zeroed_aligned`]: the
+    /// bytes land in a fresh, writable heap allocation aligned to `align`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `align` is not a power of two, or if the total allocation
+    /// size would overflow `isize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::storage::Storage;
+    ///
+    /// let storage = Storage::from_bytes_aligned(&[1, 2, 3], 4096);
+    /// assert_eq!(storage.as_bytes(), &[1, 2, 3]);
+    /// assert_eq!(storage.alignment(), 4096);
+    /// ```
+    #[must_use]
+    pub fn from_bytes_aligned(bytes: &[u8], align: usize) -> Self {
+        let mut storage = Self::zeroed_aligned(bytes.len(), align);
         storage
             .as_bytes_mut()
             .expect("freshly allocated heap storage is uniquely writable")
@@ -300,7 +328,7 @@ impl Storage {
         assert!(
             offset.checked_add(len).is_some_and(|end| end <= self.len),
             "slice {offset}..{} out of bounds of storage of length {}",
-            offset + len,
+            offset.saturating_add(len),
             self.len
         );
         Self {
@@ -320,10 +348,13 @@ impl Storage {
     /// needed. Other storages sharing the old allocation are unaffected (the
     /// RAM itself is returned to the system when the last sharer lets go).
     ///
-    /// The temporary file is unlinked immediately after mapping, so it is
-    /// reclaimed automatically when the storage is dropped (or on process
-    /// exit), and never needs manual cleanup. Spilling an empty or already
-    /// spilled storage is a no-op.
+    /// On Unix the temporary file is created readable by the owning user
+    /// only and unlinked immediately after mapping, so it is reclaimed
+    /// automatically when the storage is dropped (or on process exit) and
+    /// never needs manual cleanup. On platforms that forbid deleting a
+    /// mapped file (e.g. Windows), the file persists in `dir` until it is
+    /// removed externally. Spilling an empty or already spilled storage is a
+    /// no-op.
     ///
     /// # Errors
     ///
@@ -348,11 +379,16 @@ impl Storage {
         let path = dir
             .as_ref()
             .join(format!("datalab-spill-{}-{id}", process::id()));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        // Spilled bytes may be sensitive and `dir` may be shared (`/tmp`):
+        // keep the file private to the owning user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
         file.write_all(self.as_bytes())?;
         // SAFETY: read-only mapping of a file this process just wrote and,
         // once unlinked below, no other process can reach.
@@ -519,6 +555,12 @@ impl Storage {
     /// (other sharers keep the original bytes). Uniquely-owned heap storages
     /// are returned as-is.
     ///
+    /// The copy preserves the alignment the backing allocation was created
+    /// with, so a guarantee established via [`Storage::zeroed_aligned`]
+    /// survives copy-on-write. Memory-mapped backings (whose page alignment
+    /// was never requested by the caller) are copied at the default
+    /// [`STORAGE_ALIGN`].
+    ///
     /// # Examples
     ///
     /// ```
@@ -532,7 +574,11 @@ impl Storage {
     /// ```
     pub fn make_mut(&mut self) -> &mut [u8] {
         if !self.is_writable() {
-            *self = Self::from_bytes(self.as_bytes());
+            let align = match &*self.backing {
+                Backing::Heap { align, .. } => *align,
+                Backing::Mmap(_) => STORAGE_ALIGN,
+            };
+            *self = Self::from_bytes_aligned(self.as_bytes(), align);
         }
         self.as_bytes_mut()
             .expect("a uniquely-owned heap storage is writable")
@@ -577,6 +623,7 @@ impl fmt::Debug for Storage {
         };
         f.debug_struct("Storage")
             .field("backing", &backing)
+            .field("offset", &self.offset)
             .field("len", &self.len)
             .field("shared", &(Arc::strong_count(&self.backing) > 1))
             .finish()
@@ -658,6 +705,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_storage_pointer_honours_the_reported_alignment() {
+        let storage = Storage::zeroed_aligned(0, 64);
+        assert_eq!(storage.alignment(), 64);
+        assert_eq!(storage.as_bytes().as_ptr() as usize % 64, 0);
+    }
+
+    #[test]
+    fn from_bytes_aligned_respects_alignment() {
+        let storage = Storage::from_bytes_aligned(&[7, 8, 9], 4096);
+        assert_eq!(storage.as_bytes(), &[7, 8, 9]);
+        assert_eq!(storage.alignment(), 4096);
+        assert_eq!(storage.as_bytes().as_ptr() as usize % 4096, 0);
+    }
+
+    #[test]
+    fn make_mut_preserves_the_requested_alignment() {
+        let mut storage = Storage::zeroed_aligned(32, 4096);
+        let shared = storage.clone();
+        storage.make_mut()[0] = 1; // copy-on-write
+        assert_eq!(storage.alignment(), 4096);
+        assert_eq!(storage.as_bytes().as_ptr() as usize % 4096, 0);
+        assert_eq!(shared.as_bytes()[0], 0);
+    }
+
+    #[test]
     fn clone_is_zero_copy_and_blocks_writes_while_shared() {
         let mut storage = Storage::from_bytes(&[9, 8, 7]);
         let shared = storage.clone();
@@ -704,6 +776,12 @@ mod tests {
     #[should_panic(expected = "out of bounds")]
     fn out_of_bounds_slice_panics() {
         let _ = Storage::from_bytes(&[1, 2, 3]).slice(2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn overflowing_slice_bounds_panic_with_the_right_message() {
+        let _ = Storage::from_bytes(&[1, 2, 3]).slice(usize::MAX, 2);
     }
 
     #[test]
