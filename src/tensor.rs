@@ -257,7 +257,9 @@ impl<T: Element> Tensor<T> {
     /// If the tensor is file-backed or shared, its bytes are first
     /// **copied** into a fresh heap allocation — an explicit `O(len)`
     /// copy-on-write (sharers keep the original). Uniquely-owned writable
-    /// tensors are returned as-is.
+    /// tensors are returned as-is. The copy is aligned for `T` (and to the
+    /// default storage alignment), so the tensor invariant survives the
+    /// promotion whatever the element type.
     ///
     /// # Examples
     ///
@@ -269,7 +271,14 @@ impl<T: Element> Tensor<T> {
     /// assert_eq!(tensor.as_slice(), &[9, 2]);
     /// ```
     pub fn make_mut(&mut self) -> &mut [T] {
-        self.storage.make_mut();
+        if !self.is_writable() {
+            // The untyped storage cannot know `T`'s alignment; realign the
+            // copy here, exactly as `Tensor::zeros` does.
+            self.storage = Storage::from_bytes_aligned(
+                self.storage.as_bytes(),
+                STORAGE_ALIGN.max(align_of::<T>()),
+            );
+        }
         self.as_mut_slice()
     }
 
