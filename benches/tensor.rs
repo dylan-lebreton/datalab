@@ -66,11 +66,30 @@ fn bench_lazy_vs_eager(c: &mut Criterion) {
         bench.iter(|| black_box(&data).clone().map(|x| x * 2.0).sum());
     });
 
-    group.bench_function("lazy", |bench| {
+    // Sequential engine: measures the pure engine overhead (batching,
+    // boxed dispatch) without threading.
+    group.bench_function("lazy_seq", |bench| {
         bench.iter(|| {
             black_box(&data)
                 .clone()
                 .lazy()
+                .with_threads(1)
+                .map(|x| x * 2.0)
+                .sum()
+                .collect()
+                .unwrap()
+                .item()
+        });
+    });
+
+    // Parallel engine: 256 KiB batches give the morsel machinery enough
+    // morsels (32 for 1M f64) to spread across cores.
+    group.bench_function("lazy_par", |bench| {
+        bench.iter(|| {
+            black_box(&data)
+                .clone()
+                .lazy()
+                .with_batch_bytes(256 * 1024)
                 .map(|x| x * 2.0)
                 .sum()
                 .collect()
