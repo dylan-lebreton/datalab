@@ -155,9 +155,12 @@ of lower layers, never on their internals.
 ```
 
 - **Storage** — owns a contiguous region of raw, untyped bytes behind one
-  stable API, with pluggable backings: aligned RAM (writable) or a read-only
+  stable API, with pluggable backings: aligned RAM or a read-only
   memory-mapped file, with explicit spill-to-disk and promote-to-heap
-  transitions between them (shared memory later).
+  transitions between them (shared memory later). Allocations are
+  reference-counted (Arrow-style): clones and slices are zero-copy, and
+  mutation requires unique ownership or an explicit copy-on-write
+  (`make_mut`) — cheap things are silent, costly things are explicit.
 - **View** — a typed, shaped, non-owning lens over a `Storage`. This is where a
   logical data type interprets the bytes, and where the RAM-vs-out-of-core
   duality lives (resident random-access view vs streaming chunk iterator).
