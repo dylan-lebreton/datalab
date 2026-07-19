@@ -48,14 +48,18 @@
 //! datalab structure: the engine never builds itself out of the user-facing
 //! types layered on top of it.
 //!
-//! **Pull now, push later.** Execution is a single-threaded *pull* loop
-//! (each terminal drains its upstream streams). This is the simplest
-//! correct model, but it cannot parallelize across cores: that requires a
-//! *push* (morsel-driven) executor, where sources push batches to a pool of
-//! workers — the migration Polars had to make for its streaming engine. The
-//! seam is prepared: operators are pure batch-to-batch streams with `Send`
-//! bounds that never know who drives them, so moving to a push executor
-//! replaces only the driving loop, not the operators.
+//! **Morsel parallelism within stages, pull between them.** Each
+//! source→`map` chain is a *stage*: a producer thread pulls batches
+//! (morsels) from the source, a pool of workers applies the fused operator
+//! chain to each morsel, and an ordered reassembly hands the results
+//! downstream in source order. Merge points ([`LazyTensor::zip_with`]) and
+//! reduction combines consume their ordered inputs sequentially; the heavy
+//! per-batch work (maps, per-batch partial sums) is what runs on every
+//! core. Results are **identical whatever the thread count** (see
+//! [`LazyTensor::with_threads`]): reassembly is ordered, and reductions
+//! combine per-batch partials in batch order. This is the first slice of
+//! the push/morsel design; a fully push-driven scheduler (one global worker
+//! pool, operators as tasks) comes with the pipeline breakers.
 //!
 //! **Tree now, shared DAG later.** Binary operations give a plan multiple
 //! sources, so the arena forms a *tree* (every node feeds exactly one
@@ -64,6 +68,7 @@
 //! broadcasting; the arena representation is already shaped for it.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -71,6 +76,9 @@ use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::ops::{Add, Mul, Sub};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::kernel;
 use crate::storage::Storage;
@@ -95,16 +103,25 @@ trait BatchStream {
     fn next_batch(&mut self) -> Result<Option<Batch>, EngineError>;
 }
 
+/// A boxed batch stream, movable across threads (the parallel executor
+/// runs sources on their own producer threads).
+type BoxedStream = Box<dyn BatchStream + Send>;
+
+/// A pure, type-erased batch-to-batch operator (types checked at
+/// construction). `Sync` because one operator chain is shared by every
+/// worker of a stage.
+type Apply = Box<dyn Fn(Batch) -> Batch + Send + Sync>;
+
 /// Builds a fresh source [`BatchStream`], given the target batch size in
 /// bytes.
-type StreamFactory = Box<dyn FnOnce(usize) -> Result<Box<dyn BatchStream>, EngineError> + Send>;
+type StreamFactory = Box<dyn FnOnce(usize) -> Result<BoxedStream, EngineError> + Send>;
 
 /// Builds the stream of a binary node from its two input streams.
-type ZipFactory =
-    Box<dyn FnOnce(Box<dyn BatchStream>, Box<dyn BatchStream>) -> Box<dyn BatchStream> + Send>;
+type ZipFactory = Box<dyn FnOnce(BoxedStream, BoxedStream) -> BoxedStream + Send>;
 
-/// Builds the stream of a reduction node from its input stream.
-type ReduceFactory = Box<dyn FnOnce(Box<dyn BatchStream>) -> Box<dyn BatchStream> + Send>;
+/// Builds the sequential combine stream of a reduction from the ordered
+/// stream of its per-batch partials.
+type CombineFactory = Box<dyn FnOnce(BoxedStream) -> BoxedStream + Send>;
 
 /// Index of a node in a plan's arena.
 type NodeId = usize;
@@ -124,9 +141,9 @@ enum PlanNode {
     /// Transforms each input batch into one output batch, element-wise.
     Map {
         input: NodeId,
-        /// Pure, type-erased batch-to-batch function (types checked at
-        /// construction). Never knows who drives it (pull today, push later).
-        apply: Box<dyn Fn(Batch) -> Batch + Send>,
+        /// Never knows who drives it: the same operator runs in the
+        /// sequential pull loop and on the parallel workers.
+        apply: Apply,
     },
     /// Combines two inputs element-wise (re-chunking as needed).
     Zip {
@@ -135,11 +152,14 @@ enum PlanNode {
         label: &'static str,
         make: ZipFactory,
     },
-    /// Drains its input and emits a single (1-element) batch.
+    /// Reduces its input to a single (1-element) batch, in two halves: a
+    /// per-batch `partial` (runs on the workers, in parallel) and a
+    /// sequential `combine` that folds the ordered partials.
     Reduce {
         input: NodeId,
         label: &'static str,
-        make: ReduceFactory,
+        partial: Apply,
+        combine: CombineFactory,
     },
 }
 
@@ -230,6 +250,9 @@ pub struct LazyTensor<T: Element> {
     /// The node producing this plan's output.
     root: NodeId,
     batch_bytes: usize,
+    /// Worker threads per stage; `None` = the machine's available
+    /// parallelism, resolved at execution.
+    threads: Option<usize>,
     _out: PhantomData<T>,
 }
 
@@ -287,6 +310,7 @@ pub fn scan_file<T: Element>(path: impl AsRef<Path>) -> LazyTensor<T> {
         }],
         root: 0,
         batch_bytes: DEFAULT_BATCH_BYTES,
+        threads: None,
         _out: PhantomData,
     }
 }
@@ -327,6 +351,7 @@ pub fn generate<T: Element>(
         }],
         root: 0,
         batch_bytes: DEFAULT_BATCH_BYTES,
+        threads: None,
         _out: PhantomData,
     }
 }
@@ -372,6 +397,7 @@ impl<T: Element> Tensor<T> {
             }],
             root: 0,
             batch_bytes: DEFAULT_BATCH_BYTES,
+            threads: None,
             _out: PhantomData,
         }
     }
@@ -404,6 +430,36 @@ impl<T: Element> LazyTensor<T> {
         self
     }
 
+    /// Sets the number of worker threads per stage (default: the machine's
+    /// available parallelism). Clamped to at least 1; `with_threads(1)`
+    /// forces the fully sequential pull execution.
+    ///
+    /// Results are **identical whatever the thread count**: batches are
+    /// reassembled in source order and reductions combine per-batch
+    /// partials in batch order, so parallelism never changes a result —
+    /// including float summations. When two plans are combined by a binary
+    /// operation, an explicit setting wins over the default, and two
+    /// explicit settings keep the larger.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::lazy;
+    ///
+    /// let total = lazy::generate(1_000, |i| i as u64)
+    ///     .with_threads(4)
+    ///     .map(|x| x * 2)
+    ///     .sum()
+    ///     .collect()?
+    ///     .item();
+    /// assert_eq!(total, 999_000);
+    /// # Ok::<(), datalab::lazy::EngineError>(())
+    /// ```
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads.max(1));
+        self
+    }
+
     /// Appends an element-wise transformation to the plan.
     ///
     /// Nothing runs now; during execution each batch is transformed into a
@@ -422,7 +478,7 @@ impl<T: Element> LazyTensor<T> {
     /// # Ok::<(), datalab::lazy::EngineError>(())
     /// ```
     pub fn map<U: Element>(mut self, f: impl Fn(T) -> U + Send + Sync + 'static) -> LazyTensor<U> {
-        let apply = Box::new(move |batch: Batch| -> Batch {
+        let apply: Apply = Box::new(move |batch: Batch| -> Batch {
             let input = batch
                 .downcast::<Tensor<T>>()
                 .expect("engine invariant: batch type matches the plan chain");
@@ -436,6 +492,7 @@ impl<T: Element> LazyTensor<T> {
             root: self.nodes.len() - 1,
             nodes: self.nodes,
             batch_bytes: self.batch_bytes,
+            threads: self.threads,
             _out: PhantomData,
         }
     }
@@ -513,6 +570,10 @@ impl<T: Element> LazyTensor<T> {
             root: self.nodes.len() - 1,
             nodes: self.nodes,
             batch_bytes: self.batch_bytes.min(other.batch_bytes),
+            threads: match (self.threads, other.threads) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            },
             _out: PhantomData,
         }
     }
@@ -578,10 +639,12 @@ impl<T: Element> LazyTensor<T> {
     ///
     /// Nothing executes now — like every non-terminal, `sum` only extends
     /// the plan (same rule as Polars' `LazyFrame::sum`). On execution, each
-    /// batch is reduced with [`kernel::sum`] (pairwise) and dropped before
-    /// the next one is produced, so memory stays bounded; per-batch partial
-    /// sums are added in order, making the result deterministic for a given
-    /// batch size. Get the scalar with `.collect()?.item()`.
+    /// batch is reduced with [`kernel::sum`] (pairwise) on the workers, and
+    /// the per-batch partial sums are then added **in batch order**, so the
+    /// result is deterministic for a given batch size — including with
+    /// [`LazyTensor::with_threads`] parallelism, and including floats.
+    /// Memory stays bounded: batches are dropped as soon as their partial
+    /// is taken. Get the scalar with `.collect()?.item()`.
     ///
     /// # Examples
     ///
@@ -596,21 +659,29 @@ impl<T: Element> LazyTensor<T> {
     where
         T: Add<Output = T> + Default,
     {
-        let make: ReduceFactory = Box::new(|inner| {
-            Box::new(SumStream::<T> {
-                inner: Some(inner),
+        let partial: Apply = Box::new(|batch: Batch| -> Batch {
+            let input = batch
+                .downcast::<Tensor<T>>()
+                .expect("engine invariant: batch type matches the plan chain");
+            Box::new(Tensor::from_elements(&[kernel::sum(input.as_slice())]))
+        });
+        let combine: CombineFactory = Box::new(|partials| {
+            Box::new(SumCombineStream::<T> {
+                partials: Some(partials),
                 _elem: PhantomData,
             })
         });
         self.nodes.push(PlanNode::Reduce {
             input: self.root,
             label: "sum",
-            make,
+            partial,
+            combine,
         });
         LazyTensor {
             root: self.nodes.len() - 1,
             nodes: self.nodes,
             batch_bytes: self.batch_bytes,
+            threads: self.threads,
             _out: PhantomData,
         }
     }
@@ -659,18 +730,20 @@ impl<T: Element> LazyTensor<T> {
         Ok(())
     }
 
-    /// The pull loop: builds the stream tree from the arena, drains it, and
-    /// hands each resulting batch to `consume`; an error from `consume`
-    /// aborts the drain immediately (e.g. a full disk stops a sink at the
-    /// first failed write). This is the only place that drives execution —
-    /// swapping it for a push (parallel) executor later leaves sources,
-    /// operators and terminals untouched.
+    /// The driving loop: lowers the arena into a tree of stage streams,
+    /// drains the root, and hands each resulting batch to `consume`; an
+    /// error from `consume` aborts the drain immediately (e.g. a full disk
+    /// stops a sink at the first failed write).
     fn run(
         self,
         mut consume: impl FnMut(Tensor<T>) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
+        let threads = self.threads.unwrap_or_else(|| {
+            thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        });
         let mut nodes: Vec<Option<PlanNode>> = self.nodes.into_iter().map(Some).collect();
-        let mut stream = build_stream(&mut nodes, self.root, self.batch_bytes)?;
+        let (head, applies) = build_stage(&mut nodes, self.root, self.batch_bytes, threads)?;
+        let mut stream = finalize_stage(head, applies, threads);
         while let Some(batch) = stream.next_batch()? {
             let tensor = batch
                 .downcast::<Tensor<T>>()
@@ -732,32 +805,65 @@ impl<T: Element + Mul<Output = T>> Mul for LazyTensor<T> {
     }
 }
 
-/// Recursively instantiates the stream of node `id`, taking each node out
-/// of the arena (every node is used exactly once — the plan is a tree).
-fn build_stream(
+/// Recursively lowers node `id` into a *stage*: a head stream plus the
+/// chain of operators to apply to each of its batches. Consecutive `map`s
+/// (and a reduction's per-batch partial) accumulate into one chain, so a
+/// whole source→maps segment executes as a single fused pass per batch.
+/// Nodes are taken out of the arena (every node is used exactly once — the
+/// plan is a tree).
+fn build_stage(
     nodes: &mut [Option<PlanNode>],
     id: NodeId,
     batch_bytes: usize,
-) -> Result<Box<dyn BatchStream>, EngineError> {
+    threads: usize,
+) -> Result<(BoxedStream, Vec<Apply>), EngineError> {
     let node = nodes[id]
         .take()
         .expect("plan invariant: every node feeds exactly one consumer");
     match node {
-        PlanNode::Source { make, .. } => make(batch_bytes),
-        PlanNode::Map { input, apply } => Ok(Box::new(MapStream {
-            inner: build_stream(nodes, input, batch_bytes)?,
-            apply,
-        })),
+        PlanNode::Source { make, .. } => Ok((make(batch_bytes)?, Vec::new())),
+        PlanNode::Map { input, apply } => {
+            let (head, mut applies) = build_stage(nodes, input, batch_bytes, threads)?;
+            applies.push(apply);
+            Ok((head, applies))
+        }
         PlanNode::Zip {
             left, right, make, ..
         } => {
-            let left = build_stream(nodes, left, batch_bytes)?;
-            let right = build_stream(nodes, right, batch_bytes)?;
-            Ok(make(left, right))
+            let (l_head, l_applies) = build_stage(nodes, left, batch_bytes, threads)?;
+            let (r_head, r_applies) = build_stage(nodes, right, batch_bytes, threads)?;
+            let left = finalize_stage(l_head, l_applies, threads);
+            let right = finalize_stage(r_head, r_applies, threads);
+            Ok((make(left, right), Vec::new()))
         }
-        PlanNode::Reduce { input, make, .. } => {
-            Ok(make(build_stream(nodes, input, batch_bytes)?))
+        PlanNode::Reduce {
+            input,
+            partial,
+            combine,
+            ..
+        } => {
+            let (head, mut applies) = build_stage(nodes, input, batch_bytes, threads)?;
+            applies.push(partial);
+            let partials = finalize_stage(head, applies, threads);
+            Ok((combine(partials), Vec::new()))
         }
+    }
+}
+
+/// Turns a lowered stage into a runnable stream: a bare head passes
+/// through, a single-threaded stage applies its chain in a pull loop, and a
+/// multi-threaded stage spawns the morsel machinery (producer, worker pool,
+/// ordered reassembly).
+fn finalize_stage(head: BoxedStream, applies: Vec<Apply>, threads: usize) -> BoxedStream {
+    if applies.is_empty() {
+        head
+    } else if threads <= 1 {
+        Box::new(SeqStageStream {
+            inner: head,
+            applies,
+        })
+    } else {
+        Box::new(spawn_stage(head, applies, threads))
     }
 }
 
@@ -859,39 +965,189 @@ impl<T: Element, F: Fn(usize) -> T + Send> BatchStream for GenerateStream<T, F> 
     }
 }
 
-/// Stream applying a type-erased batch-to-batch function to its input.
-struct MapStream {
-    inner: Box<dyn BatchStream>,
-    apply: Box<dyn Fn(Batch) -> Batch + Send>,
+/// Sequential execution of a stage: applies the operator chain to each
+/// batch in a pull loop (the `with_threads(1)` path).
+struct SeqStageStream {
+    inner: BoxedStream,
+    applies: Vec<Apply>,
 }
 
-impl BatchStream for MapStream {
+impl BatchStream for SeqStageStream {
     fn next_batch(&mut self) -> Result<Option<Batch>, EngineError> {
-        Ok(self.inner.next_batch()?.map(|batch| (self.apply)(batch)))
+        Ok(self.inner.next_batch()?.map(|mut batch| {
+            for apply in &self.applies {
+                batch = apply(batch);
+            }
+            batch
+        }))
     }
 }
 
-/// Stream that drains its input on the first pull, summing every batch,
-/// then yields the single 1-element result.
-struct SumStream<T: Element> {
+/// Stream that drains the ordered per-batch partials of a sum on the first
+/// pull, adds them in batch order, then yields the single 1-element result
+/// (zero for an empty source).
+struct SumCombineStream<T: Element> {
     /// Taken on the first pull; `None` afterwards.
-    inner: Option<Box<dyn BatchStream>>,
+    partials: Option<BoxedStream>,
     _elem: PhantomData<T>,
 }
 
-impl<T: Element + Add<Output = T> + Default> BatchStream for SumStream<T> {
+impl<T: Element + Add<Output = T> + Default> BatchStream for SumCombineStream<T> {
     fn next_batch(&mut self) -> Result<Option<Batch>, EngineError> {
-        let Some(mut inner) = self.inner.take() else {
+        let Some(mut partials) = self.partials.take() else {
             return Ok(None);
         };
         let mut total = T::default();
-        while let Some(batch) = inner.next_batch()? {
-            let tensor = batch
+        while let Some(batch) = partials.next_batch()? {
+            let partial = batch
                 .downcast::<Tensor<T>>()
-                .expect("engine invariant: batch type matches the plan chain");
-            total = total + kernel::sum(tensor.as_slice());
+                .expect("engine invariant: reduction partials match the plan type");
+            total = total + partial.item();
         }
         Ok(Some(Box::new(Tensor::from_elements(&[total]))))
+    }
+}
+
+/// A message on a stage's channels: a sequence-numbered morsel (or the
+/// error that ended the source), or the producer's end-of-stream marker
+/// carrying the total morsel count.
+enum StageMsg {
+    Item(usize, Result<Batch, EngineError>),
+    Done { count: usize },
+}
+
+/// Spawns the morsel machinery of a parallel stage — a producer thread
+/// pulling from `head`, `threads` workers applying the fused `applies`
+/// chain, bounded channels end to end — and returns the ordered output
+/// stream. Backpressure: each channel holds at most `2 * threads` morsels,
+/// so in-flight memory is bounded by the batch size times a small multiple
+/// of the thread count. All threads shut down when the stage output (or an
+/// upstream channel) is dropped, so an abandoned execution leaks nothing.
+fn spawn_stage(head: BoxedStream, applies: Vec<Apply>, threads: usize) -> StageOutput {
+    let (work_tx, work_rx) = sync_channel::<StageMsg>(2 * threads);
+    let (out_tx, out_rx) = sync_channel::<StageMsg>(2 * threads);
+    let work_rx = Arc::new(Mutex::new(work_rx));
+    let applies = Arc::new(applies);
+
+    for _ in 0..threads {
+        let work_rx = Arc::clone(&work_rx);
+        let out_tx = out_tx.clone();
+        let applies = Arc::clone(&applies);
+        thread::spawn(move || worker_loop(&work_rx, &out_tx, &applies));
+    }
+    drop(out_tx); // the workers hold the only senders now
+    thread::spawn(move || producer_loop(head, &work_tx));
+
+    StageOutput {
+        rx: out_rx,
+        buffer: BTreeMap::new(),
+        next_seq: 0,
+        expected: None,
+        done: false,
+    }
+}
+
+/// The producer half of a parallel stage: pulls batches from the head
+/// stream, tags them with sequence numbers, and pushes them to the workers.
+/// Ends with a `Done` marker (or an in-band error), and stops early if the
+/// stage was dropped downstream (the send fails).
+fn producer_loop(mut head: BoxedStream, work_tx: &SyncSender<StageMsg>) {
+    let mut seq = 0;
+    loop {
+        match head.next_batch() {
+            Ok(Some(batch)) => {
+                if work_tx.send(StageMsg::Item(seq, Ok(batch))).is_err() {
+                    return;
+                }
+                seq += 1;
+            }
+            Ok(None) => break,
+            Err(err) => {
+                let _ = work_tx.send(StageMsg::Item(seq, Err(err)));
+                return;
+            }
+        }
+    }
+    let _ = work_tx.send(StageMsg::Done { count: seq });
+}
+
+/// A worker of a parallel stage: takes morsels from the shared work queue,
+/// applies the fused operator chain, and forwards the result (errors and
+/// the `Done` marker pass through untouched). The lock guards only the
+/// `recv` — the work itself runs unlocked.
+fn worker_loop(
+    work_rx: &Mutex<Receiver<StageMsg>>,
+    out_tx: &SyncSender<StageMsg>,
+    applies: &[Apply],
+) {
+    loop {
+        let Ok(msg) = ({
+            let Ok(guard) = work_rx.lock() else { return };
+            guard.recv()
+        }) else {
+            return; // producer gone and queue drained: normal shutdown
+        };
+        let msg = match msg {
+            StageMsg::Item(seq, Ok(mut batch)) => {
+                for apply in applies {
+                    batch = apply(batch);
+                }
+                StageMsg::Item(seq, Ok(batch))
+            }
+            passthrough => passthrough,
+        };
+        if out_tx.send(msg).is_err() {
+            return; // stage output dropped: execution was abandoned
+        }
+    }
+}
+
+/// The ordered output of a parallel stage: receives out-of-order morsels
+/// from the workers and yields them strictly in source order, buffering
+/// early arrivals (bounded by the channel capacities plus the worker
+/// count). Completion is positively acknowledged by the producer's `Done`
+/// count, so a lost morsel is detected, never silently skipped.
+struct StageOutput {
+    rx: Receiver<StageMsg>,
+    /// Early arrivals, keyed by sequence number.
+    buffer: BTreeMap<usize, Result<Batch, EngineError>>,
+    /// Next sequence number to yield.
+    next_seq: usize,
+    /// Total morsel count, once the producer announced it.
+    expected: Option<usize>,
+    /// Set after an error was yielded; the stage then reads as exhausted.
+    done: bool,
+}
+
+impl BatchStream for StageOutput {
+    fn next_batch(&mut self) -> Result<Option<Batch>, EngineError> {
+        loop {
+            if let Some(item) = self.buffer.remove(&self.next_seq) {
+                self.next_seq += 1;
+                return match item {
+                    Ok(batch) => Ok(Some(batch)),
+                    Err(err) => {
+                        self.done = true;
+                        Err(err)
+                    }
+                };
+            }
+            if self.done || self.expected == Some(self.next_seq) {
+                return Ok(None);
+            }
+            match self.rx.recv() {
+                Ok(StageMsg::Item(seq, item)) => {
+                    self.buffer.insert(seq, item);
+                }
+                Ok(StageMsg::Done { count }) => self.expected = Some(count),
+                // Every sender is gone but the stream is not complete: a
+                // worker died mid-morsel (a panicking user closure). There
+                // is no batch to resume from — surface it loudly.
+                Err(_) => panic!(
+                    "an engine worker thread panicked; a batch in flight was lost"
+                ),
+            }
+        }
     }
 }
 
@@ -901,7 +1157,7 @@ impl<T: Element + Add<Output = T> + Default> BatchStream for SumStream<T> {
 /// [`Chunked::advance`] marks elements as consumed. At most one upstream
 /// batch is held at a time, so memory stays bounded.
 struct Chunked<T: Element> {
-    stream: Box<dyn BatchStream>,
+    stream: BoxedStream,
     /// The batch currently being consumed, and how many of its elements
     /// have been consumed already.
     pending: Option<(Tensor<T>, usize)>,
@@ -910,7 +1166,7 @@ struct Chunked<T: Element> {
 }
 
 impl<T: Element> Chunked<T> {
-    fn new(stream: Box<dyn BatchStream>) -> Self {
+    fn new(stream: BoxedStream) -> Self {
         Self {
             stream,
             pending: None,
@@ -1173,6 +1429,91 @@ mod tests {
         .unwrap()
         .item();
         assert_eq!(total, 9_999.0 * 10_000.0);
+    }
+
+    #[test]
+    fn parallel_map_preserves_source_order() {
+        // 1 element per batch => 200 morsels across 4 workers; the ordered
+        // reassembly must still yield them in source order.
+        let out = generate(200, |i| i as i64)
+            .with_batch_bytes(8)
+            .with_threads(4)
+            .map(|x| x * 3)
+            .collect()
+            .unwrap();
+        assert_eq!(out, Tensor::from_fn(200, |i| 3 * i as i64));
+    }
+
+    #[test]
+    fn results_are_identical_whatever_the_thread_count() {
+        // Float summation order is fixed by the batch boundaries, not by
+        // thread scheduling: every thread count gives the same bits. Only
+        // IEEE-exact operations here (no libm calls, whose last bits Miri
+        // deliberately randomizes): 1/x makes the sum order-sensitive.
+        let run = |threads: usize| {
+            generate(1_000, |i| 1.0 / (i as f64 + 1.0))
+                .with_batch_bytes(128)
+                .with_threads(threads)
+                .map(|x| x * 1.000_1)
+                .sum()
+                .collect()
+                .unwrap()
+                .item()
+        };
+        let sequential = run(1);
+        assert_eq!(sequential, run(4));
+        assert_eq!(sequential, run(13));
+    }
+
+    #[test]
+    fn parallel_binary_ops_and_reductions_match_eager() {
+        let total = (generate(1_000, |i| i as f64)
+            .with_batch_bytes(64)
+            .with_threads(4)
+            .map(|x| x + 1.0)
+            + generate(1_000, |i| (2 * i) as f64).map(|x| x * 0.5))
+        .sum()
+        .collect()
+        .unwrap()
+        .item();
+        let eager = (&(&Tensor::from_fn(1_000, |i| i as f64) + &Tensor::from_fn(1_000, |_| 1.0))
+            + &Tensor::from_fn(1_000, |i| i as f64))
+            .sum();
+        assert_eq!(total, eager);
+    }
+
+    #[test]
+    fn more_threads_than_batches_is_fine() {
+        let out = generate(3, |i| i as u64)
+            .with_threads(16)
+            .map(|x| x + 1)
+            .collect()
+            .unwrap();
+        assert_eq!(out.as_slice(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn parallel_error_still_aborts_cleanly() {
+        // A length mismatch below a parallel stage propagates as an error,
+        // not a hang or a panic.
+        let result = (generate(5, |i| i as f64) + generate(9, |i| i as f64))
+            .with_threads(4)
+            .map(|x| x * 2.0)
+            .collect();
+        assert!(matches!(result, Err(EngineError::LengthMismatch)));
+    }
+
+    #[test]
+    #[should_panic(expected = "worker thread panicked")]
+    fn panicking_map_closure_aborts_execution() {
+        let _ = generate(100, |i| i as f64)
+            .with_batch_bytes(8)
+            .with_threads(2)
+            .map(|x| {
+                assert!(x < 50.0, "boom");
+                x
+            })
+            .collect();
     }
 
     #[test]
