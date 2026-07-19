@@ -180,7 +180,7 @@ minimal.
 - [x] `Storage` — aligned, contiguous byte storage (RAM-backed)
 - [x] `View` / `ViewMut` — typed, zero-copy interpretation of bytes
 - [x] `Tensor` — owned, contiguous, typed 1-D tensor
-- [ ] Element-wise kernels + benchmarks (criterion)
+- [x] Element-wise kernels + benchmarks (criterion)
 - [ ] Pluggable backing store (mmap, spill-to-disk)
 - [ ] Streaming engine — bounded-memory operators over batches, lazy API
       (`LazyTensor`: `collect`, `sink`)
