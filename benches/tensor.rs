@@ -47,5 +47,46 @@ fn bench_sum(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_add, bench_mul_scalar, bench_sum);
+/// Eager pipeline vs the same pipeline through the lazy engine: measures the
+/// engine's overhead (batching, per-batch allocation/copy, boxed dispatch).
+fn bench_lazy_vs_eager(c: &mut Criterion) {
+    let n = 1_000_000;
+    let mut group = c.benchmark_group("map_sum_f64_1M");
+    group.throughput(Throughput::Bytes((n * size_of::<f64>()) as u64));
+
+    let data = Tensor::from_fn(n, |i| (i % 100) as f64);
+
+    group.bench_function("eager", |bench| {
+        bench.iter(|| black_box(&data).map(|x| x * 2.0).sum());
+    });
+
+    // Same as "eager" plus the source clone the lazy path is forced to pay
+    // (`lazy()` consumes the tensor): the fair apples-to-apples baseline.
+    group.bench_function("eager_cloned", |bench| {
+        bench.iter(|| black_box(&data).clone().map(|x| x * 2.0).sum());
+    });
+
+    group.bench_function("lazy", |bench| {
+        bench.iter(|| {
+            black_box(&data)
+                .clone()
+                .lazy()
+                .map(|x| x * 2.0)
+                .sum()
+                .collect()
+                .unwrap()
+                .item()
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_add,
+    bench_mul_scalar,
+    bench_sum,
+    bench_lazy_vs_eager
+);
 criterion_main!(benches);
