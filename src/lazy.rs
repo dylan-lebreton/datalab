@@ -409,7 +409,10 @@ impl<T: Element> LazyTensor<T> {
     /// Returns [`EngineError`] if the source cannot be opened or validated.
     pub fn collect(self) -> Result<Tensor<T>, EngineError> {
         let mut batches: Vec<Tensor<T>> = Vec::new();
-        self.run(|batch| batches.push(batch))?;
+        self.run(|batch| {
+            batches.push(batch);
+            Ok(())
+        })?;
 
         let total: usize = batches.iter().map(Tensor::len).sum();
         let mut out = Tensor::<T>::zeros(total);
@@ -432,8 +435,8 @@ impl<T: Element> LazyTensor<T> {
     /// sums are added in order, making the result deterministic for a given
     /// batch size. Get the scalar with `.collect()?.item()`.
     ///
-    /// Configure [`LazyTensor::with_batch_bytes`] *before* `sum`: the
-    /// reduction stage keeps the batch size it was built with.
+    /// [`LazyTensor::with_batch_bytes`] configures the whole plan wherever
+    /// it is called — before or after `sum` — like every other plan method.
     ///
     /// # Examples
     ///
@@ -457,9 +460,16 @@ impl<T: Element> LazyTensor<T> {
         LazyTensor {
             source: SourceNode {
                 label,
-                make: Box::new(move |_outer_batch_bytes| {
+                make: Box::new(move |batch_bytes| {
+                    // The batch size configured on the outer plan (possibly
+                    // after `sum`) drives the inner drain too.
+                    let mut inner = self;
+                    inner.batch_bytes = batch_bytes;
                     let mut total = T::default();
-                    self.run(|batch| total = total + kernel::sum(batch.as_slice()))?;
+                    inner.run(|batch| {
+                        total = total + kernel::sum(batch.as_slice());
+                        Ok(())
+                    })?;
                     Ok(Box::new(OnceStream { value: Some(total) }))
                 }),
             },
@@ -481,7 +491,8 @@ impl<T: Element> LazyTensor<T> {
     /// # Errors
     ///
     /// Returns [`EngineError`] if the source cannot be opened, if writing
-    /// fails, or if `path` is the very file the plan scans
+    /// fails, or if `path` refers to the very file the plan scans — also
+    /// through symlinks or hard links
     /// ([`EngineError::SinkIntoSource`] — sinking into the source would
     /// overwrite it while reading it).
     ///
@@ -497,37 +508,31 @@ impl<T: Element> LazyTensor<T> {
     /// ```
     pub fn sink_file(self, path: impl AsRef<Path>) -> Result<(), EngineError> {
         let path = path.as_ref();
-        if let Some(source) = &self.source_path {
-            // Best-effort: canonicalization fails harmlessly if either path
-            // does not exist yet.
-            if let (Ok(a), Ok(b)) = (fs::canonicalize(source), fs::canonicalize(path))
-                && a == b
-            {
-                return Err(EngineError::SinkIntoSource);
-            }
+        if let Some(source) = &self.source_path
+            && is_same_file(source, path)
+        {
+            return Err(EngineError::SinkIntoSource);
         }
 
         let mut file = fs::File::create(path)?;
-        let mut write_error: Option<io::Error> = None;
         self.run(|batch| {
-            if write_error.is_none()
-                && let Err(err) = file.write_all(batch.storage().as_bytes())
-            {
-                write_error = Some(err);
-            }
+            file.write_all(batch.storage().as_bytes())
+                .map_err(EngineError::Io)
         })?;
-        if let Some(err) = write_error {
-            return Err(EngineError::Io(err));
-        }
         file.flush()?;
         Ok(())
     }
 
     /// The pull loop: drains the source through the operators, handing each
-    /// resulting batch to `consume`. This is the only place that drives
-    /// execution — swapping it for a push (parallel) executor later leaves
-    /// sources, operators and terminals untouched.
-    fn run(self, mut consume: impl FnMut(Tensor<T>)) -> Result<(), EngineError> {
+    /// resulting batch to `consume`; an error from `consume` aborts the
+    /// drain immediately (e.g. a full disk stops a sink at the first failed
+    /// write). This is the only place that drives execution — swapping it
+    /// for a push (parallel) executor later leaves sources, operators and
+    /// terminals untouched.
+    fn run(
+        self,
+        mut consume: impl FnMut(Tensor<T>) -> Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
         let mut stream = (self.source.make)(self.batch_bytes)?;
         while let Some(mut batch) = stream.next_batch() {
             for op in &self.ops {
@@ -536,7 +541,7 @@ impl<T: Element> LazyTensor<T> {
             let tensor = batch
                 .downcast::<Tensor<T>>()
                 .expect("engine invariant: final batch type matches the plan output");
-            consume(*tensor);
+            consume(*tensor)?;
         }
         Ok(())
     }
@@ -545,6 +550,27 @@ impl<T: Element> LazyTensor<T> {
 /// Computes how many `T` elements fit the byte target (at least one).
 fn batch_elems<T: Element>(batch_bytes: usize) -> usize {
     (batch_bytes / size_of::<T>()).max(1)
+}
+
+/// Returns `true` when `a` and `b` refer to the same underlying file — also
+/// through symlinks or hard links. Best-effort: `false` when either path
+/// cannot be inspected (e.g. it does not exist yet).
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (fs::canonicalize(a), fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
 }
 
 /// Stream over a storage viewable as `[T]` (in-memory or memory-mapped):
@@ -660,6 +686,19 @@ mod tests {
     }
 
     #[test]
+    fn with_batch_bytes_after_sum_configures_the_whole_plan() {
+        // Same plan method rules everywhere: configuring the batch size
+        // after the reduction still drives the inner drain.
+        let total = generate(100, |i| i as u64)
+            .sum()
+            .with_batch_bytes(8) // 1 u64 per batch
+            .collect()
+            .unwrap()
+            .item();
+        assert_eq!(total, 4950);
+    }
+
+    #[test]
     fn sum_is_chainable_like_any_plan() {
         // A reduction yields a 1-element lazy tensor: still mappable.
         let result = generate(10, |i| i as f64)
@@ -761,6 +800,22 @@ mod tests {
         // The source file is intact.
         assert_eq!(Tensor::<f64>::map_file(&path).unwrap().as_slice(), &[1.0]);
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg_attr(miri, ignore)]
+    fn sink_into_a_hard_link_of_the_scanned_file_is_refused() {
+        let path = temp_path("hardlink-src");
+        let link = temp_path("hardlink-dst");
+        fs::write(&path, Tensor::from_elements(&[1.0f64]).storage().as_bytes()).unwrap();
+        fs::hard_link(&path, &link).unwrap();
+        let result = scan_file::<f64>(&path).sink_file(&link);
+        assert!(matches!(result, Err(EngineError::SinkIntoSource)));
+        // The source file is intact.
+        assert_eq!(Tensor::<f64>::map_file(&path).unwrap().as_slice(), &[1.0]);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(&link).unwrap();
     }
 
     #[test]
