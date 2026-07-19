@@ -10,6 +10,9 @@ keywords = ["data-structures", "streaming", "out-of-core", "tensor", "tree"]
 categories = ["data-structures", "science"]
 
 [dependencies]
+# Memory-mapped files for the storage backing (out-of-core read path).
+# Ecosystem standard, used by safetensors, ripgrep and wasmtime.
+memmap2 = "0.9"
 
 # Dev-only: benchmark harness. Library users do not inherit this.
 [dev-dependencies]

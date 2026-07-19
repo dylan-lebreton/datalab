@@ -85,6 +85,10 @@ pub enum ViewError {
         /// Alignment, in bytes, required by the element type.
         required: usize,
     },
+    /// The storage is read-only (e.g. memory-mapped), so no mutable view can
+    /// be created. Promote it first with
+    /// [`Storage::make_mut`](crate::storage::Storage::make_mut).
+    ReadOnly,
 }
 
 impl fmt::Display for ViewError {
@@ -99,6 +103,12 @@ impl fmt::Display for ViewError {
             ),
             Self::Misaligned { required } => {
                 write!(f, "storage is not aligned to {required} bytes")
+            }
+            Self::ReadOnly => {
+                write!(
+                    f,
+                    "storage is read-only (memory-mapped); promote it with Storage::make_mut"
+                )
             }
         }
     }
@@ -229,13 +239,18 @@ impl<'a, T: Element> ViewMut<'a, T> {
     /// # Errors
     ///
     /// Returns [`ViewError`] if the storage's byte length is not a multiple of
-    /// `size_of::<T>()`, or if it is not aligned for `T`.
+    /// `size_of::<T>()`, if it is not aligned for `T`, or if it is read-only
+    /// ([`ViewError::ReadOnly`], e.g. memory-mapped).
     pub fn new(storage: &'a mut Storage) -> Result<Self, ViewError> {
         let len = checked_len::<T>(storage.as_bytes())?;
         let data = if len == 0 {
             &mut []
         } else {
-            let ptr = storage.as_bytes_mut().as_mut_ptr().cast::<T>();
+            let ptr = storage
+                .as_bytes_mut()
+                .ok_or(ViewError::ReadOnly)?
+                .as_mut_ptr()
+                .cast::<T>();
             // SAFETY: `checked_len` verified length and alignment; `T: Element`
             // makes any bit pattern valid; `&mut storage` guarantees exclusive
             // access to initialized bytes for `'a`.
@@ -382,5 +397,30 @@ mod tests {
             element_size: 8,
         };
         assert!(err.to_string().contains("not a multiple"));
+        assert!(ViewError::ReadOnly.to_string().contains("read-only"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // file-backed mmap is not supported under miri
+    fn mutable_view_over_read_only_storage_is_refused() {
+        let mut storage = Storage::from_elements(&[1.0f64, 2.0]);
+        storage.spill_to_disk(std::env::temp_dir()).unwrap();
+        assert_eq!(ViewMut::<f64>::new(&mut storage).unwrap_err(), ViewError::ReadOnly);
+        // Read views still work fine.
+        assert_eq!(&*View::<f64>::new(&storage).unwrap(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn end_to_end_file_to_typed_view() {
+        // The core out-of-core promise, in miniature: bytes on disk, viewed
+        // as typed numbers with zero copy, reduced by a kernel.
+        let elements: Vec<f64> = (0..1000).map(f64::from).collect();
+        let mut storage = Storage::from_elements(&elements);
+        storage.spill_to_disk(std::env::temp_dir()).unwrap();
+
+        let view = View::<f64>::new(&storage).unwrap();
+        assert_eq!(view.len(), 1000);
+        assert_eq!(crate::kernel::sum(&view), 999.0 * 1000.0 / 2.0);
     }
 }
