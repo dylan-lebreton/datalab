@@ -183,6 +183,8 @@ minimal.
 - [x] `Tensor` — owned, contiguous, typed 1-D tensor
 - [x] Element-wise kernels + benchmarks (criterion)
 - [x] Pluggable backing store (mmap, spill-to-disk)
+- [x] `Tensor::map_file` / `Tensor::spill_to_disk` — disk-resident tensors,
+      larger than RAM
 - [ ] Streaming engine — bounded-memory operators over batches, lazy API
       (`LazyTensor`: `collect`, `sink`)
 - [ ] N-D tensor (shape/strides)
