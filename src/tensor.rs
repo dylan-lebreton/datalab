@@ -15,7 +15,9 @@
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::{Add, Mul, Sub};
 
+use crate::kernel;
 use crate::storage::{STORAGE_ALIGN, Storage};
 use crate::view::{Element, View, ViewMut};
 
@@ -234,6 +236,104 @@ impl<T: Element> Tensor<T> {
     pub fn into_storage(self) -> Storage {
         self.storage
     }
+
+    /// Returns the sum of all elements (zero for an empty tensor).
+    ///
+    /// Uses [`kernel::sum`]: strict left-to-right accumulation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::tensor::Tensor;
+    ///
+    /// let tensor = Tensor::from_elements(&[1.0f64, 2.5, -0.5]);
+    /// assert_eq!(tensor.sum(), 3.0);
+    /// ```
+    #[must_use]
+    pub fn sum(&self) -> T
+    where
+        T: Add<Output = T> + Default,
+    {
+        kernel::sum(self.as_slice())
+    }
+
+    /// Returns a new tensor where element `i` is `f(self[i])`.
+    ///
+    /// The output element type may differ from the input's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::tensor::Tensor;
+    ///
+    /// let lengths = Tensor::from_elements(&[1.5f64, -2.0]);
+    /// let rounded: Tensor<i64> = lengths.map(|x| x.round() as i64);
+    /// assert_eq!(rounded.as_slice(), &[2, -2]);
+    /// ```
+    #[must_use]
+    pub fn map<U: Element>(&self, mut f: impl FnMut(T) -> U) -> Tensor<U> {
+        let mut out = Tensor::<U>::zeros(self.len());
+        for (o, &x) in out.as_mut_slice().iter_mut().zip(self.as_slice()) {
+            *o = f(x);
+        }
+        out
+    }
+}
+
+/// Element-wise addition: `&a + &b`.
+///
+/// # Panics
+///
+/// Panics if the tensors do not have the same length.
+impl<T: Element + Add<Output = T>> Add for &Tensor<T> {
+    type Output = Tensor<T>;
+
+    fn add(self, rhs: Self) -> Tensor<T> {
+        let mut out = Tensor::zeros(self.len());
+        kernel::add(self.as_slice(), rhs.as_slice(), out.as_mut_slice());
+        out
+    }
+}
+
+/// Element-wise subtraction: `&a - &b`.
+///
+/// # Panics
+///
+/// Panics if the tensors do not have the same length.
+impl<T: Element + Sub<Output = T>> Sub for &Tensor<T> {
+    type Output = Tensor<T>;
+
+    fn sub(self, rhs: Self) -> Tensor<T> {
+        let mut out = Tensor::zeros(self.len());
+        kernel::sub(self.as_slice(), rhs.as_slice(), out.as_mut_slice());
+        out
+    }
+}
+
+/// Element-wise product: `&a * &b`.
+///
+/// # Panics
+///
+/// Panics if the tensors do not have the same length.
+impl<T: Element + Mul<Output = T>> Mul for &Tensor<T> {
+    type Output = Tensor<T>;
+
+    fn mul(self, rhs: Self) -> Tensor<T> {
+        let mut out = Tensor::zeros(self.len());
+        kernel::mul(self.as_slice(), rhs.as_slice(), out.as_mut_slice());
+        out
+    }
+}
+
+/// Scalar multiplication: `&a * scalar`.
+impl<T: Element + Mul<Output = T>> Mul<T> for &Tensor<T> {
+    type Output = Tensor<T>;
+
+    fn mul(self, scalar: T) -> Tensor<T> {
+        let mut out = Tensor::zeros(self.len());
+        kernel::mul_scalar(self.as_slice(), scalar, out.as_mut_slice());
+        out
+    }
 }
 
 impl<T: Element + PartialEq> PartialEq for Tensor<T> {
@@ -356,5 +456,33 @@ mod tests {
     fn debug_prints_elements() {
         let tensor = Tensor::from_elements(&[1u8, 2]);
         assert_eq!(format!("{tensor:?}"), "[1, 2]");
+    }
+
+    #[test]
+    fn elementwise_operators() {
+        let a = Tensor::from_elements(&[1.0f64, 2.0, 3.0]);
+        let b = Tensor::from_elements(&[10.0f64, 20.0, 30.0]);
+        assert_eq!((&a + &b).as_slice(), &[11.0, 22.0, 33.0]);
+        assert_eq!((&b - &a).as_slice(), &[9.0, 18.0, 27.0]);
+        assert_eq!((&a * &b).as_slice(), &[10.0, 40.0, 90.0]);
+        assert_eq!((&a * 2.0).as_slice(), &[2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn add_panics_on_length_mismatch() {
+        let a = Tensor::from_elements(&[1i32, 2]);
+        let b = Tensor::from_elements(&[1i32, 2, 3]);
+        let _ = &a + &b;
+    }
+
+    #[test]
+    fn sum_and_map() {
+        let tensor = Tensor::from_elements(&[1i64, -2, 3]);
+        assert_eq!(tensor.sum(), 2);
+        let doubled = tensor.map(|x| x * 2);
+        assert_eq!(doubled.as_slice(), &[2, -4, 6]);
+        let as_f64: Tensor<f64> = tensor.map(|x| x as f64);
+        assert_eq!(as_f64.as_slice(), &[1.0, -2.0, 3.0]);
     }
 }

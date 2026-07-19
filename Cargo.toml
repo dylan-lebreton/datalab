@@ -11,6 +11,14 @@ categories = ["data-structures", "science"]
 
 [dependencies]
 
+# Dev-only: benchmark harness. Library users do not inherit this.
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "tensor"
+harness = false
+
 # Optimizations applied in `--release` (build, test --release, bench).
 [profile.release]
 lto = "fat"          # link-time optimization across all crates

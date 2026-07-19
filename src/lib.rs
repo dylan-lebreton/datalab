@@ -9,6 +9,7 @@
 #![warn(missing_debug_implementations)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+pub mod kernel;
 pub mod storage;
 pub mod tensor;
 pub mod view;
