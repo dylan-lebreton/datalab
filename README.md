@@ -90,9 +90,12 @@ longer, without a cluster budget.
 use datalab::lazy;
 
 // A binary file of f32 weights, potentially far larger than RAM.
+// Nothing executes until collect() or sink_file() — no exceptions.
 let norm = lazy::scan_file::<f32>("model-weights.bin")
     .map(|w| w * w)
-    .sum()?;                            // streams in small batches, bounded memory
+    .sum()          // still lazy: a 1-element plan
+    .collect()?     // executes: streams in small batches, bounded memory
+    .item();
 
 lazy::scan_file::<f32>("model-weights.bin")
     .map(|w| w * 0.5)
