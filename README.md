@@ -136,9 +136,10 @@ of lower layers, never on their internals.
    Bytes        alignment, bit-packing, memory
 ```
 
-- **Storage** — owns a contiguous region of raw, untyped bytes. Its backing
-  store is meant to become pluggable (RAM, memory-mapped files, spill-to-disk,
-  shared memory) behind one stable API.
+- **Storage** — owns a contiguous region of raw, untyped bytes behind one
+  stable API, with pluggable backings: aligned RAM (writable) or a read-only
+  memory-mapped file, with explicit spill-to-disk and promote-to-heap
+  transitions between them (shared memory later).
 - **View** — a typed, shaped, non-owning lens over a `Storage`. This is where a
   logical data type interprets the bytes, and where the RAM-vs-out-of-core
   duality lives (resident random-access view vs streaming chunk iterator).
@@ -181,7 +182,7 @@ minimal.
 - [x] `View` / `ViewMut` — typed, zero-copy interpretation of bytes
 - [x] `Tensor` — owned, contiguous, typed 1-D tensor
 - [x] Element-wise kernels + benchmarks (criterion)
-- [ ] Pluggable backing store (mmap, spill-to-disk)
+- [x] Pluggable backing store (mmap, spill-to-disk)
 - [ ] Streaming engine — bounded-memory operators over batches, lazy API
       (`LazyTensor`: `collect`, `sink`)
 - [ ] N-D tensor (shape/strides)
