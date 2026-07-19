@@ -13,13 +13,56 @@
 //! This module contains no `unsafe` code: it composes the safe APIs of
 //! [`Storage`] and the typed views.
 
+use std::error::Error;
 use std::fmt;
+use std::io;
 use std::marker::PhantomData;
 use std::ops::{Add, Mul, Sub};
+use std::path::Path;
 
 use crate::kernel;
 use crate::storage::{STORAGE_ALIGN, Storage};
-use crate::view::{Element, View, ViewMut};
+use crate::view::{Element, View, ViewError, ViewMut};
+
+/// The reason a tensor could not be created from a file.
+#[derive(Debug)]
+pub enum TensorFileError {
+    /// Opening or mapping the file failed.
+    Io(io::Error),
+    /// The file's bytes cannot be viewed as the requested element type (e.g.
+    /// its size is not a whole number of elements).
+    View(ViewError),
+}
+
+impl fmt::Display for TensorFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "cannot map file: {err}"),
+            Self::View(err) => write!(f, "file bytes do not form a tensor: {err}"),
+        }
+    }
+}
+
+impl Error for TensorFileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::View(err) => Some(err),
+        }
+    }
+}
+
+impl From<io::Error> for TensorFileError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<ViewError> for TensorFileError {
+    fn from(err: ViewError) -> Self {
+        Self::View(err)
+    }
+}
 
 /// An owned, contiguous, fixed-length 1-D tensor of elements `T`.
 ///
@@ -36,9 +79,10 @@ use crate::view::{Element, View, ViewMut};
 #[derive(Clone)]
 pub struct Tensor<T: Element> {
     /// Invariant: the byte length is a multiple of `size_of::<T>()` and the
-    /// allocation is aligned for `T`, so the storage is always viewable as
-    /// `[T]`. Every constructor goes through [`Tensor::zeros`], which
-    /// guarantees both.
+    /// bytes are aligned for `T`, so the storage is always viewable as `[T]`.
+    /// In-memory constructors go through [`Tensor::zeros`] which guarantees
+    /// both; [`Tensor::map_file`] validates the invariant before accepting a
+    /// file (mappings are page-aligned).
     storage: Storage,
     _elem: PhantomData<T>,
 }
@@ -109,6 +153,106 @@ impl<T: Element> Tensor<T> {
         tensor
     }
 
+    /// Opens `path` as a **read-only**, disk-resident tensor.
+    ///
+    /// The file is memory-mapped, not read up front: the OS loads pages on
+    /// first access and evicts them under memory pressure, so the tensor may
+    /// be far larger than the available RAM. Reads (`as_slice`, `view`,
+    /// kernels, operators) work as usual; mutation requires an explicit
+    /// [`Tensor::make_mut`] first (see [`Tensor::is_writable`]).
+    ///
+    /// See [`Storage::map_file`] for the file-stability contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TensorFileError::Io`] if the file cannot be opened or
+    /// mapped, and [`TensorFileError::View`] if its byte length is not a
+    /// whole number of `T` elements.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use datalab::tensor::Tensor;
+    ///
+    /// // A 40 GB weight file on a 16 GB machine: opens instantly.
+    /// let weights = Tensor::<f32>::map_file("model-weights.bin")?;
+    /// let norm = weights.map(|w| w * w).sum();
+    /// # Ok::<(), datalab::tensor::TensorFileError>(())
+    /// ```
+    pub fn map_file(path: impl AsRef<Path>) -> Result<Self, TensorFileError> {
+        let storage = Storage::map_file(path)?;
+        // Validate the invariant up front (mappings are page-aligned, so in
+        // practice only the size check can fail).
+        View::<T>::new(&storage)?;
+        Ok(Self {
+            storage,
+            _elem: PhantomData,
+        })
+    }
+
+    /// Moves the elements into a temporary file inside `dir`, releasing the
+    /// tensor's RAM while keeping it readable (memory-mapped).
+    ///
+    /// The tensor becomes read-only; promote it back with
+    /// [`Tensor::make_mut`]. See [`Storage::spill_to_disk`] for details.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error from writing or mapping the temporary file.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use datalab::tensor::Tensor;
+    ///
+    /// let mut batch = Tensor::from_elements(&[1.0f64, 2.0]);
+    /// batch.spill_to_disk(std::env::temp_dir())?; // RAM released
+    /// assert_eq!(batch.sum(), 3.0);               // still readable
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn spill_to_disk(&mut self, dir: impl AsRef<Path>) -> io::Result<()> {
+        self.storage.spill_to_disk(dir)
+    }
+
+    /// Returns `true` if the elements can be mutated in place.
+    ///
+    /// Tensors built in memory are writable; tensors backed by a file
+    /// ([`Tensor::map_file`], [`Tensor::spill_to_disk`]) are not, until
+    /// promoted with [`Tensor::make_mut`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::tensor::Tensor;
+    ///
+    /// assert!(Tensor::<f64>::zeros(2).is_writable());
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn is_writable(&self) -> bool {
+        self.storage.is_writable()
+    }
+
+    /// Ensures the tensor is writable, then returns its mutable elements.
+    ///
+    /// If the tensor is file-backed (read-only), its bytes are first
+    /// **copied** into a fresh heap allocation — an explicit `O(len)` cost.
+    /// Writable tensors are returned as-is.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::tensor::Tensor;
+    ///
+    /// let mut tensor = Tensor::from_elements(&[1u32, 2]);
+    /// tensor.make_mut()[0] = 9;
+    /// assert_eq!(tensor.as_slice(), &[9, 2]);
+    /// ```
+    pub fn make_mut(&mut self) -> &mut [T] {
+        self.storage.make_mut();
+        self.as_mut_slice()
+    }
+
     /// Returns the number of elements.
     ///
     /// # Examples
@@ -158,6 +302,11 @@ impl<T: Element> Tensor<T> {
 
     /// Returns the elements as a mutable slice.
     ///
+    /// # Panics
+    ///
+    /// Panics if the tensor is read-only (file-backed): check
+    /// [`Tensor::is_writable`] or promote with [`Tensor::make_mut`] first.
+    ///
     /// # Examples
     ///
     /// ```
@@ -191,6 +340,11 @@ impl<T: Element> Tensor<T> {
 
     /// Returns a mutable typed view of the tensor.
     ///
+    /// # Panics
+    ///
+    /// Panics if the tensor is read-only (file-backed): check
+    /// [`Tensor::is_writable`] or promote with [`Tensor::make_mut`] first.
+    ///
     /// # Examples
     ///
     /// ```
@@ -203,7 +357,13 @@ impl<T: Element> Tensor<T> {
     #[inline]
     #[must_use]
     pub fn view_mut(&mut self) -> ViewMut<'_, T> {
-        ViewMut::new(&mut self.storage).expect("Tensor invariant: storage is viewable as [T]")
+        match ViewMut::new(&mut self.storage) {
+            Ok(view) => view,
+            Err(ViewError::ReadOnly) => {
+                panic!("tensor is read-only (file-backed); promote it with make_mut()")
+            }
+            Err(_) => unreachable!("Tensor invariant: storage is viewable as [T]"),
+        }
     }
 
     /// Returns a reference to the underlying byte storage.
@@ -485,5 +645,78 @@ mod tests {
         assert_eq!(doubled.as_slice(), &[2, -4, 6]);
         let as_f64: Tensor<f64> = tensor.map(|x| x as f64);
         assert_eq!(as_f64.as_slice(), &[1.0, -2.0, 3.0]);
+    }
+
+    /// Creates a unique temp-file path for file-based tests.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "datalab-tensor-test-{tag}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // file-backed mmap is not supported under miri
+    fn map_file_reads_tensor_from_disk() {
+        let source = Tensor::from_elements(&[1.5f64, -2.0, 4.5]);
+        let path = temp_path("map");
+        std::fs::write(&path, source.storage().as_bytes()).unwrap();
+
+        let mapped = Tensor::<f64>::map_file(&path).unwrap();
+        assert_eq!(mapped.as_slice(), &[1.5, -2.0, 4.5]);
+        assert_eq!(mapped.sum(), 4.0);
+        assert!(!mapped.is_writable());
+        drop(mapped);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn map_file_rejects_partial_elements() {
+        let path = temp_path("badsize");
+        std::fs::write(&path, [0u8; 5]).unwrap(); // not a multiple of 8
+        let err = Tensor::<f64>::map_file(&path).unwrap_err();
+        assert!(matches!(err, TensorFileError::View(_)));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // filesystem access is blocked by miri isolation
+    fn map_file_of_missing_file_is_io_error() {
+        let err = Tensor::<f64>::map_file(temp_path("missing")).unwrap_err();
+        assert!(matches!(err, TensorFileError::Io(_)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn spill_keeps_tensor_readable_and_make_mut_promotes() {
+        let mut tensor = Tensor::from_elements(&[1u32, 2, 3]);
+        tensor.spill_to_disk(std::env::temp_dir()).unwrap();
+        assert!(!tensor.is_writable());
+        assert_eq!(tensor.as_slice(), &[1, 2, 3]);
+        assert_eq!(tensor.sum(), 6);
+
+        tensor.make_mut()[0] = 9;
+        assert!(tensor.is_writable());
+        assert_eq!(tensor.as_slice(), &[9, 2, 3]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    #[should_panic(expected = "read-only")]
+    fn mutating_a_spilled_tensor_panics_with_a_clear_message() {
+        let mut tensor = Tensor::from_elements(&[1u32, 2]);
+        tensor.spill_to_disk(std::env::temp_dir()).unwrap();
+        let _ = tensor.as_mut_slice();
+    }
+
+    #[test]
+    fn tensor_file_error_displays() {
+        let err = TensorFileError::View(crate::view::ViewError::ReadOnly);
+        assert!(err.to_string().contains("tensor"));
+        assert!(std::error::Error::source(&err).is_some());
     }
 }
