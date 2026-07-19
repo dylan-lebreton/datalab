@@ -84,6 +84,21 @@ longer, without a cluster budget.
 | Geospatial | Points, trajectories | Fragmented, slow tooling | Native geo types + spatial indexes |
 | Data analysis | DataFrames | Polars streaming can break | Never-break streaming dataframes |
 
+## A taste
+
+```rust
+use datalab::lazy;
+
+// A binary file of f32 weights, potentially far larger than RAM.
+let norm = lazy::scan_file::<f32>("model-weights.bin")
+    .map(|w| w * w)
+    .sum()?;                            // streams in small batches, bounded memory
+
+lazy::scan_file::<f32>("model-weights.bin")
+    .map(|w| w * 0.5)
+    .sink_file("weights-halved.bin")?;  // file -> file, never materialized
+```
+
 ## Design principles
 
 1. **Streaming is a transverse property, not a feature of one structure.**
@@ -185,8 +200,11 @@ minimal.
 - [x] Pluggable backing store (mmap, spill-to-disk)
 - [x] `Tensor::map_file` / `Tensor::spill_to_disk` — disk-resident tensors,
       larger than RAM
-- [ ] Streaming engine — bounded-memory operators over batches, lazy API
-      (`LazyTensor`: `collect`, `sink`)
+- [x] Lazy engine v1 — plan-as-data, batched pull execution
+      (`scan_file` / `.lazy()` / `generate` → `map` → `collect` / `sum` /
+      `sink_file`), bounded memory end to end
+- [ ] Engine v2 — parallel (push/morsel) execution, plan DAG (lazy binary
+      ops), pipeline breakers with spill (sort, group_by, join)
 - [ ] N-D tensor (shape/strides)
 - [ ] Trees as views over index tensors
 - [ ] Additional frontends (DataFrame, Geo) and Arrow interop
