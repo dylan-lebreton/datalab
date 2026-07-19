@@ -124,6 +124,9 @@ impl Error for ViewError {}
 /// Validates that `bytes` can be reinterpreted as `[T]` and returns the element
 /// count.
 fn checked_len<T: Element>(bytes: &[u8]) -> Result<usize, ViewError> {
+    // Backstop for the `Element` contract: a zero-sized type would divide by
+    // zero below, so reject it at compile time instead.
+    const { assert!(size_of::<T>() != 0, "Element types must not be zero-sized") };
     let element_size = size_of::<T>();
     if !bytes.len().is_multiple_of(element_size) {
         return Err(ViewError::SizeMismatch {
@@ -245,21 +248,20 @@ impl<'a, T: Element> ViewMut<'a, T> {
     ///
     /// Returns [`ViewError`] if the storage's byte length is not a multiple of
     /// `size_of::<T>()`, if it is not aligned for `T`, or if it is read-only
-    /// ([`ViewError::ReadOnly`], e.g. memory-mapped).
+    /// ([`ViewError::ReadOnly`], e.g. memory-mapped or shared — even for an
+    /// empty storage).
     pub fn new(storage: &'a mut Storage) -> Result<Self, ViewError> {
         let len = checked_len::<T>(storage.as_bytes())?;
+        // Even a zero-length mutable view requires a writable storage: the
+        // read-only gate must not depend on the length.
+        let bytes = storage.as_bytes_mut().ok_or(ViewError::ReadOnly)?;
         let data = if len == 0 {
             &mut []
         } else {
-            let ptr = storage
-                .as_bytes_mut()
-                .ok_or(ViewError::ReadOnly)?
-                .as_mut_ptr()
-                .cast::<T>();
             // SAFETY: `checked_len` verified length and alignment; `T: Element`
             // makes any bit pattern valid; `&mut storage` guarantees exclusive
             // access to initialized bytes for `'a`.
-            unsafe { slice::from_raw_parts_mut(ptr, len) }
+            unsafe { slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<T>(), len) }
         };
         Ok(Self { data })
     }
@@ -403,6 +405,17 @@ mod tests {
         };
         assert!(err.to_string().contains("not a multiple"));
         assert!(ViewError::ReadOnly.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn mutable_view_over_empty_shared_storage_is_refused() {
+        // The read-only gate holds even when there is nothing to mutate.
+        let mut storage = Storage::zeroed(0);
+        let _shared = storage.clone();
+        assert_eq!(
+            ViewMut::<f64>::new(&mut storage).unwrap_err(),
+            ViewError::ReadOnly
+        );
     }
 
     #[test]
