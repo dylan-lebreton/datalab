@@ -1,13 +1,16 @@
 //! The lazy, streaming execution engine — v1.
 //!
 //! A [`LazyTensor`] is a **plan**: a description of computations to run
-//! later, built by chaining methods (like a Polars `LazyFrame`). Nothing
-//! executes until a *terminal* is called:
+//! later, built by chaining methods (like a Polars `LazyFrame`). The rule is
+//! uniform, with no exception to memorize:
 //!
-//! - [`LazyTensor::collect`] — run the plan and materialize a [`Tensor`];
-//! - [`LazyTensor::sum`] — run the plan as a streaming reduction;
-//! - [`LazyTensor::sink_file`] — run the plan and stream the result to a
-//!   file, **never materializing** it in memory.
+//! > **Nothing executes until [`LazyTensor::collect`] or
+//! > [`LazyTensor::sink_file`] is called.** Every other method — including
+//! > reductions like [`LazyTensor::sum`] — only extends the plan.
+//!
+//! `collect` runs the plan and materializes the result as a [`Tensor`];
+//! `sink_file` runs the plan and streams the result to a file **without ever
+//! materializing it**.
 //!
 //! Execution is *batched*: the source produces small contiguous [`Tensor`]
 //! batches (sized in bytes, see [`LazyTensor::with_batch_bytes`]), each
@@ -21,7 +24,9 @@
 //!
 //! let total = lazy::generate(1_000, |i| i as f64)
 //!     .map(|x| x * 2.0)
-//!     .sum()?;
+//!     .sum()          // still lazy: a 1-element plan
+//!     .collect()?     // the only thing that executes
+//!     .item();
 //! assert_eq!(total, 999_000.0);
 //! # Ok::<(), datalab::lazy::EngineError>(())
 //! ```
@@ -189,7 +194,9 @@ impl<T: Element> fmt::Debug for LazyTensor<T> {
 /// // 40 GB of f32 weights on disk, a few MiB of RAM used.
 /// let norm = lazy::scan_file::<f32>("model-weights.bin")
 ///     .map(|w| w * w)
-///     .sum()?;
+///     .sum()          // still lazy
+///     .collect()?     // executes, streaming
+///     .item();
 /// # Ok::<(), datalab::lazy::EngineError>(())
 /// ```
 pub fn scan_file<T: Element>(path: impl AsRef<Path>) -> LazyTensor<T> {
@@ -318,7 +325,9 @@ impl<T: Element> LazyTensor<T> {
     ///
     /// let sum = lazy::generate(10, |i| i as u64)
     ///     .with_batch_bytes(16) // tiny batches: 2 u64 per batch
-    ///     .sum()?;
+    ///     .sum()
+    ///     .collect()?
+    ///     .item();
     /// assert_eq!(sum, 45);
     /// # Ok::<(), datalab::lazy::EngineError>(())
     /// ```
@@ -413,24 +422,52 @@ impl<T: Element> LazyTensor<T> {
         Ok(out)
     }
 
-    /// Runs the plan as a streaming reduction and returns the sum of all
-    /// produced elements (zero for an empty source).
+    /// Appends a streaming sum reduction to the plan, yielding a **lazy**
+    /// one-element tensor (zero for an empty source).
     ///
-    /// Memory stays bounded: each batch is reduced with [`kernel::sum`]
-    /// (pairwise) and dropped before the next one is produced; per-batch
-    /// partial sums are then added in order, so the result is deterministic
-    /// for a given batch size.
+    /// Nothing executes now — like every non-terminal, `sum` only extends
+    /// the plan (same rule as Polars' `LazyFrame::sum`). On execution, each
+    /// batch is reduced with [`kernel::sum`] (pairwise) and dropped before
+    /// the next one is produced, so memory stays bounded; per-batch partial
+    /// sums are added in order, making the result deterministic for a given
+    /// batch size. Get the scalar with `.collect()?.item()`.
     ///
-    /// # Errors
+    /// Configure [`LazyTensor::with_batch_bytes`] *before* `sum`: the
+    /// reduction stage keeps the batch size it was built with.
     ///
-    /// Returns [`EngineError`] if the source cannot be opened or validated.
-    pub fn sum(self) -> Result<T, EngineError>
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::lazy;
+    ///
+    /// let plan = lazy::generate(100, |i| i as u64).sum(); // still lazy
+    /// assert_eq!(plan.collect()?.item(), 4950);
+    /// # Ok::<(), datalab::lazy::EngineError>(())
+    /// ```
+    pub fn sum(self) -> LazyTensor<T>
     where
         T: Add<Output = T> + Default,
     {
-        let mut total = T::default();
-        self.run(|batch| total = total + kernel::sum(batch.as_slice()))?;
-        Ok(total)
+        // The reduction wraps the whole plan built so far into a new source
+        // that, once executed, drains it and emits a single 1-element batch.
+        // In explain() it still reads as one linear chain ending in "-> sum".
+        let label = format!("{}\n  -> sum", self.explain());
+        let batch_bytes = self.batch_bytes;
+        let source_path = self.source_path.clone();
+        LazyTensor {
+            source: SourceNode {
+                label,
+                make: Box::new(move |_outer_batch_bytes| {
+                    let mut total = T::default();
+                    self.run(|batch| total = total + kernel::sum(batch.as_slice()))?;
+                    Ok(Box::new(OnceStream { value: Some(total) }))
+                }),
+            },
+            ops: Vec::new(),
+            batch_bytes,
+            source_path,
+            _out: PhantomData,
+        }
     }
 
     /// Runs the plan and streams the result to a file, without ever
@@ -537,6 +574,19 @@ impl<T: Element> BatchStream for StorageStream<T> {
     }
 }
 
+/// Stream that yields a single one-element batch (the result of a
+/// reduction), then ends.
+struct OnceStream<T: Element> {
+    value: Option<T>,
+}
+
+impl<T: Element> BatchStream for OnceStream<T> {
+    fn next_batch(&mut self) -> Option<Batch> {
+        let value = self.value.take()?;
+        Some(Box::new(Tensor::from_elements(&[value])))
+    }
+}
+
 /// Stream that generates elements on the fly with a function of the index.
 struct GenerateStream<T, F> {
     f: F,
@@ -599,13 +649,25 @@ mod tests {
     }
 
     #[test]
-    fn sum_streams_and_matches_eager() {
-        let lazy_sum = generate(10_000, |i| (i % 7) as f64)
+    fn sum_stays_lazy_then_streams_and_matches_eager() {
+        let plan = generate(10_000, |i| (i % 7) as f64)
             .with_batch_bytes(256)
-            .sum()
-            .unwrap();
+            .sum(); // nothing has executed yet
+        assert!(plan.explain().contains("-> sum"));
+        let lazy_sum = plan.collect().unwrap().item();
         let eager_sum = Tensor::from_fn(10_000, |i| (i % 7) as f64).sum();
         assert_eq!(lazy_sum, eager_sum);
+    }
+
+    #[test]
+    fn sum_is_chainable_like_any_plan() {
+        // A reduction yields a 1-element lazy tensor: still mappable.
+        let result = generate(10, |i| i as f64)
+            .sum()
+            .map(|total| total / 10.0)
+            .collect()
+            .unwrap();
+        assert_eq!(result.item(), 4.5);
     }
 
     #[test]
@@ -621,7 +683,7 @@ mod tests {
     #[test]
     fn empty_source_yields_empty_results() {
         assert!(generate(0, |i| i as f64).collect().unwrap().is_empty());
-        assert_eq!(generate(0, |i| i as f64).sum().unwrap(), 0.0);
+        assert_eq!(generate(0, |i| i as f64).sum().collect().unwrap().item(), 0.0);
     }
 
     #[test]
@@ -643,7 +705,9 @@ mod tests {
             .with_batch_bytes(1024)
             .map(|x| x * 2.0)
             .sum()
-            .unwrap();
+            .collect()
+            .unwrap()
+            .item();
         assert_eq!(total, 2.0 * source.sum());
         fs::remove_file(&path).unwrap();
     }
@@ -651,8 +715,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn scan_file_of_missing_file_errors_at_execution() {
-        let plan = scan_file::<f64>(temp_path("missing"));
-        assert!(matches!(plan.sum(), Err(EngineError::Source(_))));
+        let plan = scan_file::<f64>(temp_path("missing")).sum(); // still no error: lazy
+        assert!(matches!(plan.collect(), Err(EngineError::Source(_))));
     }
 
     #[test]

@@ -397,6 +397,33 @@ impl<T: Element> Tensor<T> {
         self.storage
     }
 
+    /// Returns the single element of a one-element tensor.
+    ///
+    /// The typical way to read a lazy reduction's result:
+    /// `plan.sum().collect()?.item()` (mirrors Polars' `item()`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tensor does not hold exactly one element.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::tensor::Tensor;
+    ///
+    /// assert_eq!(Tensor::from_elements(&[42i32]).item(), 42);
+    /// ```
+    #[must_use]
+    pub fn item(&self) -> T {
+        assert_eq!(
+            self.len(),
+            1,
+            "item() requires a tensor of exactly one element, got {}",
+            self.len()
+        );
+        self.as_slice()[0]
+    }
+
     /// Returns the sum of all elements (zero for an empty tensor).
     ///
     /// Uses [`kernel::sum`]: deterministic pairwise summation — vectorizable,
