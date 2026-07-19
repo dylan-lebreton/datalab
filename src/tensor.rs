@@ -239,7 +239,8 @@ impl<T: Element> Tensor<T> {
 
     /// Returns the sum of all elements (zero for an empty tensor).
     ///
-    /// Uses [`kernel::sum`]: strict left-to-right accumulation.
+    /// Uses [`kernel::sum`]: deterministic pairwise summation — vectorizable,
+    /// and more accurate than a naive left-to-right fold for floats.
     ///
     /// # Examples
     ///

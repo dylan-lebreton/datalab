@@ -104,12 +104,25 @@ pub fn mul_scalar<T: Element + Mul<Output = T>>(a: &[T], scalar: T, out: &mut [T
     }
 }
 
+/// Number of independent accumulators in the base case of [`sum`]. Breaking
+/// the single dependency chain into 8 lanes is what lets the compiler
+/// vectorize the reduction.
+const SUM_LANES: usize = 8;
+
+/// Length up to which [`sum`] uses the blocked base case directly; longer
+/// inputs are split recursively (pairwise summation).
+const SUM_BLOCK: usize = 256;
+
 /// Returns the sum of all elements, starting from `T::default()` (zero for
 /// every primitive).
 ///
-/// The accumulation is strict left-to-right. For floats this is the plain
-/// sequential semantics (not pairwise/compensated); fancier reductions can be
-/// added later without changing callers.
+/// Uses **pairwise summation** with a multi-accumulator base case: the input
+/// is split recursively into halves, and short blocks are reduced with 8
+/// independent accumulator lanes. The order of additions is fixed and
+/// deterministic, but differs from a strict left-to-right fold — for floats
+/// the rounding error grows in `O(log n)` instead of `O(n)`, i.e. this is
+/// both faster (vectorizable) and more accurate than the naive loop. For
+/// integers the result is identical to the naive loop.
 ///
 /// # Examples
 ///
@@ -119,7 +132,28 @@ pub fn mul_scalar<T: Element + Mul<Output = T>>(a: &[T], scalar: T, out: &mut [T
 /// ```
 #[must_use]
 pub fn sum<T: Element + Add<Output = T> + Default>(a: &[T]) -> T {
-    a.iter().fold(T::default(), |acc, &x| acc + x)
+    if a.len() <= SUM_BLOCK {
+        return sum_block(a);
+    }
+    // Split on a lane-aligned midpoint so every base-case block (except the
+    // final one) is a whole number of lanes.
+    let mid = (a.len() / 2).next_multiple_of(SUM_LANES);
+    sum(&a[..mid]) + sum(&a[mid..])
+}
+
+/// Base case of [`sum`]: reduces a short block with independent accumulator
+/// lanes, then combines the lanes and folds the remainder.
+fn sum_block<T: Element + Add<Output = T> + Default>(a: &[T]) -> T {
+    let mut lanes = [T::default(); SUM_LANES];
+    let chunks = a.chunks_exact(SUM_LANES);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        for (lane, &x) in lanes.iter_mut().zip(chunk) {
+            *lane = *lane + x;
+        }
+    }
+    let total = lanes.into_iter().fold(T::default(), |acc, lane| acc + lane);
+    remainder.iter().fold(total, |acc, &x| acc + x)
 }
 
 #[cfg(test)]
@@ -158,6 +192,25 @@ mod tests {
     fn sum_accumulates() {
         assert_eq!(sum(&[1u32, 2, 3]), 6);
         assert_eq!(sum::<f64>(&[]), 0.0);
+    }
+
+    #[test]
+    fn sum_handles_every_length_boundary() {
+        // Cover: empty, below/at/above the lane count, at/around the block
+        // size, and deep into the recursive pairwise path.
+        for len in [0, 1, 7, 8, 9, 255, 256, 257, 1000, 4096, 100_000] {
+            let data: Vec<u64> = (1..=len as u64).collect();
+            let expected = len as u64 * (len as u64 + 1) / 2;
+            assert_eq!(sum(&data), expected, "len = {len}");
+        }
+    }
+
+    #[test]
+    fn sum_matches_naive_float_sum_closely() {
+        let data: Vec<f64> = (0..10_000).map(|i| (i as f64).sin()).collect();
+        let naive: f64 = data.iter().sum();
+        let ours = sum(&data);
+        assert!((ours - naive).abs() < 1e-9, "ours={ours}, naive={naive}");
     }
 
     #[test]
