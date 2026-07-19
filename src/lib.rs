@@ -10,6 +10,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod kernel;
+pub mod lazy;
 pub mod storage;
 pub mod tensor;
 pub mod view;

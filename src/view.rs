@@ -20,6 +20,11 @@ use crate::storage::Storage;
 
 /// Types that can be safely reinterpreted from raw bytes.
 ///
+/// Elements are plain data through and through: the `Copy + Send + Sync +
+/// 'static` supertraits mean an element owns no resources and can freely
+/// cross thread boundaries — which the engine relies on to move batches
+/// around (and, later, to execute plans in parallel).
+///
 /// # Safety
 ///
 /// Implementing this trait asserts that the type is `Copy`, has a non-zero
@@ -28,7 +33,7 @@ use crate::storage::Storage;
 /// value. This holds for the integer and floating-point primitives, but not
 /// for types with invalid bit patterns such as `bool` or `char`, nor for
 /// zero-sized types.
-pub unsafe trait Element: Copy {}
+pub unsafe trait Element: Copy + Send + Sync + 'static {}
 
 macro_rules! impl_element {
     ($($t:ty),* $(,)?) => {
