@@ -209,8 +209,10 @@ minimal.
 - [x] Lazy engine v1 — plan-as-data, batched pull execution
       (`scan_file` / `.lazy()` / `generate` → `map` → `collect` / `sum` /
       `sink_file`), bounded memory end to end
-- [ ] Engine v2 — parallel (push/morsel) execution, plan DAG (lazy binary
-      ops), pipeline breakers with spill (sort, group_by, join)
+- [x] Engine v2: plan DAG — node-arena plans, lazy element-wise binary
+      operations (`a + b`, `zip_with`) with re-chunking zip streams
+- [ ] Engine v2: parallel (push/morsel) execution
+- [ ] Engine v2: pipeline breakers with spill (sort, group_by, join)
 - [ ] N-D tensor (shape/strides)
 - [ ] Trees as views over index tensors
 - [ ] Additional frontends (DataFrame, Geo) and Arrow interop
