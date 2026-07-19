@@ -98,7 +98,12 @@ pub fn mul<T: Element + Mul<Output = T>>(a: &[T], b: &[T], out: &mut [T]) {
 /// assert_eq!(out, [3.0, -6.0]);
 /// ```
 pub fn mul_scalar<T: Element + Mul<Output = T>>(a: &[T], scalar: T, out: &mut [T]) {
-    check_lens(a.len(), a.len(), out.len());
+    assert!(
+        a.len() == out.len(),
+        "kernel length mismatch: a={}, out={}",
+        a.len(),
+        out.len()
+    );
     for (o, &x) in out.iter_mut().zip(a) {
         *o = x * scalar;
     }
