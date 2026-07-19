@@ -1,7 +1,7 @@
 //! # datalab
 //!
 //! Highly-optimized, streaming-capable data structures for Rust
-//! (trees, tensors, stacks, and more).
+//! (trees, tensors, and more).
 //!
 //! **Status:** early development — the public API is not stable yet.
 
