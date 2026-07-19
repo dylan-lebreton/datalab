@@ -66,6 +66,11 @@ impl From<ViewError> for TensorFileError {
 
 /// An owned, contiguous, fixed-length 1-D tensor of elements `T`.
 ///
+/// Cloning is **zero-copy** (the clone shares the bytes, Arrow-style): while
+/// shared, neither tensor is writable in place — mutate through the explicit
+/// [`Tensor::make_mut`], which copies on write. See
+/// [`Storage`](crate::storage) for the sharing model.
+///
 /// # Examples
 ///
 /// ```
@@ -153,6 +158,18 @@ impl<T: Element> Tensor<T> {
         tensor
     }
 
+    /// Wraps an existing storage without copying.
+    ///
+    /// Internal: callers must provide a storage upholding the invariant
+    /// (whole number of `T`-aligned elements), which is re-checked here.
+    pub(crate) fn from_storage(storage: Storage) -> Self {
+        View::<T>::new(&storage).expect("storage must be viewable as [T]");
+        Self {
+            storage,
+            _elem: PhantomData,
+        }
+    }
+
     /// Opens `path` as a **read-only**, disk-resident tensor.
     ///
     /// The file is memory-mapped, not read up front: the OS loads pages on
@@ -216,9 +233,10 @@ impl<T: Element> Tensor<T> {
 
     /// Returns `true` if the elements can be mutated in place.
     ///
-    /// Tensors built in memory are writable; tensors backed by a file
-    /// ([`Tensor::map_file`], [`Tensor::spill_to_disk`]) are not, until
-    /// promoted with [`Tensor::make_mut`].
+    /// Tensors built in memory are writable while uniquely owned; tensors
+    /// backed by a file ([`Tensor::map_file`], [`Tensor::spill_to_disk`]) or
+    /// currently **shared** (cloned zero-copy) are not, until promoted with
+    /// [`Tensor::make_mut`].
     ///
     /// # Examples
     ///
@@ -233,11 +251,13 @@ impl<T: Element> Tensor<T> {
         self.storage.is_writable()
     }
 
-    /// Ensures the tensor is writable, then returns its mutable elements.
+    /// Ensures the tensor is uniquely writable, then returns its mutable
+    /// elements.
     ///
-    /// If the tensor is file-backed (read-only), its bytes are first
-    /// **copied** into a fresh heap allocation — an explicit `O(len)` cost.
-    /// Writable tensors are returned as-is.
+    /// If the tensor is file-backed or shared, its bytes are first
+    /// **copied** into a fresh heap allocation — an explicit `O(len)`
+    /// copy-on-write (sharers keep the original). Uniquely-owned writable
+    /// tensors are returned as-is.
     ///
     /// # Examples
     ///
@@ -304,8 +324,9 @@ impl<T: Element> Tensor<T> {
     ///
     /// # Panics
     ///
-    /// Panics if the tensor is read-only (file-backed): check
-    /// [`Tensor::is_writable`] or promote with [`Tensor::make_mut`] first.
+    /// Panics if the tensor is not writable in place (file-backed or
+    /// shared): check [`Tensor::is_writable`] or promote with
+    /// [`Tensor::make_mut`] first.
     ///
     /// # Examples
     ///
@@ -342,8 +363,9 @@ impl<T: Element> Tensor<T> {
     ///
     /// # Panics
     ///
-    /// Panics if the tensor is read-only (file-backed): check
-    /// [`Tensor::is_writable`] or promote with [`Tensor::make_mut`] first.
+    /// Panics if the tensor is not writable in place (file-backed or
+    /// shared): check [`Tensor::is_writable`] or promote with
+    /// [`Tensor::make_mut`] first.
     ///
     /// # Examples
     ///
@@ -360,7 +382,10 @@ impl<T: Element> Tensor<T> {
         match ViewMut::new(&mut self.storage) {
             Ok(view) => view,
             Err(ViewError::ReadOnly) => {
-                panic!("tensor is read-only (file-backed); promote it with make_mut()")
+                panic!(
+                    "tensor is not writable in place (file-backed or shared); \
+                     promote it with make_mut()"
+                )
             }
             Err(_) => unreachable!("Tensor invariant: storage is viewable as [T]"),
         }
@@ -602,12 +627,25 @@ mod tests {
     }
 
     #[test]
-    fn clone_is_a_deep_copy() {
+    fn clone_is_zero_copy_with_copy_on_write() {
         let original = Tensor::from_elements(&[1u8, 2]);
         let mut copy = original.clone();
-        copy.as_mut_slice()[0] = 9;
+        // Shared: same bytes, no in-place mutation.
+        assert_eq!(copy.as_slice().as_ptr(), original.as_slice().as_ptr());
+        assert!(!copy.is_writable());
+        // Explicit copy-on-write diverges the clone, sharers keep theirs.
+        copy.make_mut()[0] = 9;
         assert_eq!(original.as_slice(), &[1, 2]);
         assert_eq!(copy.as_slice(), &[9, 2]);
+        assert!(original.is_writable()); // unique again
+    }
+
+    #[test]
+    #[should_panic(expected = "not writable in place")]
+    fn mutating_a_shared_tensor_panics_with_a_clear_message() {
+        let mut tensor = Tensor::from_elements(&[1u8, 2]);
+        let _shared = tensor.clone();
+        let _ = tensor.as_mut_slice();
     }
 
     #[test]
@@ -733,7 +771,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    #[should_panic(expected = "read-only")]
+    #[should_panic(expected = "not writable in place")]
     fn mutating_a_spilled_tensor_panics_with_a_clear_message() {
         let mut tensor = Tensor::from_elements(&[1u32, 2]);
         tensor.spill_to_disk(std::env::temp_dir()).unwrap();

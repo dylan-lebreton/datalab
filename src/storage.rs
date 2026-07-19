@@ -18,9 +18,18 @@
 //!
 //! [`Storage::spill_to_disk`] moves a heap storage's bytes into a temporary
 //! memory-mapped file, releasing the RAM while keeping the bytes readable —
-//! the primitive a memory-budgeted engine needs. [`Storage::make_mut`] goes
-//! the other way, promoting a read-only mapped storage back to a writable
-//! heap copy. Both directions are explicit: nothing here copies silently.
+//! the primitive a memory-budgeted engine needs.
+//!
+//! # Sharing and copy-on-write
+//!
+//! The underlying allocation is reference-counted (the Arrow/Polars model):
+//! [`Storage::clone`] and [`Storage::slice`] are **zero-copy** — they share
+//! the same bytes and cost an atomic increment. In exchange, in-place
+//! mutation requires **unique** ownership of a heap backing:
+//! [`Storage::as_bytes_mut`] returns `None` while the bytes are shared or
+//! memory-mapped, and [`Storage::make_mut`] performs the **explicit**
+//! copy-on-write promotion. Cheap things are silent, costly things are
+//! explicit — never the other way around.
 
 use std::alloc::{self, Layout};
 use std::fmt;
@@ -30,6 +39,7 @@ use std::path::Path;
 use std::process;
 use std::ptr::NonNull;
 use std::slice;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
@@ -54,14 +64,15 @@ pub const STORAGE_ALIGN: usize = if cfg!(target_arch = "aarch64") {
 /// Counter making spill file names unique within the process.
 static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Where a [`Storage`]'s bytes physically live.
+/// Where a [`Storage`]'s bytes physically live. Shared behind an [`Arc`];
+/// dropped (and freed) when the last sharer goes away.
 enum Backing {
-    /// Owned, writable, aligned heap allocation.
+    /// Owned, writable (when uniquely held), aligned heap allocation.
     Heap {
         /// Pointer to the first byte. For an empty storage this is a dangling
-        /// but well-aligned pointer and no allocation is held.
+        /// but non-null pointer and no allocation is held.
         ptr: NonNull<u8>,
-        /// Number of bytes.
+        /// Number of bytes of the allocation.
         len: usize,
         /// Alignment the allocation was created with; needed to free it.
         align: usize,
@@ -70,6 +81,15 @@ enum Backing {
     Mmap(Mmap),
 }
 
+// SAFETY: the heap allocation is owned by exactly one `Backing` (no interior
+// mutability; mutation goes through `Arc::get_mut`, i.e. exclusive access),
+// and `memmap2::Mmap` is itself `Send`.
+unsafe impl Send for Backing {}
+
+// SAFETY: shared references to a `Backing` only permit reads, and
+// `memmap2::Mmap` is itself `Sync`.
+unsafe impl Sync for Backing {}
+
 impl Drop for Backing {
     fn drop(&mut self) {
         if let Self::Heap { ptr, len, align } = *self
@@ -77,19 +97,22 @@ impl Drop for Backing {
         {
             let layout = Layout::from_size_align(len, align).expect("layout was valid on alloc");
             // SAFETY: `ptr` was allocated with exactly this layout (same
-            // non-zero `len` and `align`) and is freed only once, here.
+            // non-zero `len` and `align`) and is freed only once, here — the
+            // `Arc` guarantees this runs when the last sharer is dropped.
             unsafe { alloc::dealloc(ptr.as_ptr(), layout) };
         }
     }
 }
 
-/// Owns a contiguous region of raw, untyped bytes.
+/// Owns (possibly jointly) a contiguous region of raw, untyped bytes.
 ///
-/// `Storage` is the lowest-level building block of datalab: it holds a
-/// contiguous run of bytes with a known length and says nothing about how they
-/// are interpreted. Interpreting them as a typed, shaped array is the job of a
-/// view layered on top. The bytes may live in RAM or in a memory-mapped file —
-/// see the [module documentation](self) for the available backings.
+/// `Storage` is the lowest-level building block of datalab: it exposes a
+/// window (`offset`/`len`) over a reference-counted allocation and says
+/// nothing about how the bytes are interpreted. Interpreting them as a
+/// typed, shaped array is the job of a view layered on top. The bytes may
+/// live in RAM or in a memory-mapped file, and are shared zero-copy by
+/// [`Storage::clone`] and [`Storage::slice`] — see the
+/// [module documentation](self).
 ///
 /// # Examples
 ///
@@ -99,19 +122,20 @@ impl Drop for Backing {
 /// let mut storage = Storage::zeroed(4);
 /// storage.as_bytes_mut().unwrap()[1] = 42;
 /// assert_eq!(storage.as_bytes(), &[0, 42, 0, 0]);
+///
+/// let shared = storage.clone();              // zero-copy
+/// assert!(storage.as_bytes_mut().is_none()); // shared => not writable
+/// drop(shared);
+/// assert!(storage.as_bytes_mut().is_some()); // unique again
 /// ```
 pub struct Storage {
-    backing: Backing,
+    /// Invariant: `offset + len <= backing.len()`.
+    backing: Arc<Backing>,
+    /// Start of this storage's window into the backing.
+    offset: usize,
+    /// Number of bytes of this storage's window.
+    len: usize,
 }
-
-// SAFETY: both backings are safe to move across threads: the heap allocation
-// is uniquely owned with no interior mutability (like `Vec<u8>`), and
-// `memmap2::Mmap` is itself `Send`.
-unsafe impl Send for Storage {}
-
-// SAFETY: `&Storage` only permits reads and there is no interior mutability;
-// `memmap2::Mmap` is itself `Sync`.
-unsafe impl Sync for Storage {}
 
 impl Storage {
     /// Creates a storage of `len` zero-initialized bytes, using the default
@@ -154,24 +178,25 @@ impl Storage {
             "alignment must be a power of two, got {align}"
         );
 
-        if len == 0 {
+        let backing = if len == 0 {
             // No allocation for an empty storage: a dangling (but non-null)
             // pointer is a valid base for a zero-length slice.
-            return Self {
-                backing: Backing::Heap {
-                    ptr: NonNull::dangling(),
-                    len: 0,
-                    align,
-                },
-            };
-        }
-
-        let layout = Layout::from_size_align(len, align).expect("allocation size overflow");
-        // SAFETY: `layout` has a non-zero size (checked `len != 0` above).
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+            Backing::Heap {
+                ptr: NonNull::dangling(),
+                len: 0,
+                align,
+            }
+        } else {
+            let layout = Layout::from_size_align(len, align).expect("allocation size overflow");
+            // SAFETY: `layout` has a non-zero size (checked `len != 0` above).
+            let ptr = unsafe { alloc::alloc_zeroed(layout) };
+            let ptr = NonNull::new(ptr).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+            Backing::Heap { ptr, len, align }
+        };
         Self {
-            backing: Backing::Heap { ptr, len, align },
+            backing: Arc::new(backing),
+            offset: 0,
+            len,
         }
     }
 
@@ -195,7 +220,7 @@ impl Storage {
         let mut storage = Self::zeroed(bytes.len());
         storage
             .as_bytes_mut()
-            .expect("freshly allocated heap storage is writable")
+            .expect("freshly allocated heap storage is uniquely writable")
             .copy_from_slice(bytes);
         storage
     }
@@ -242,18 +267,58 @@ impl Storage {
         // SAFETY: we create a read-only mapping of a file we just opened. The
         // caller accepts the documented file-stability contract above.
         let mmap = unsafe { Mmap::map(&file)? };
+        let len = mmap.len();
         Ok(Self {
-            backing: Backing::Mmap(mmap),
+            backing: Arc::new(Backing::Mmap(mmap)),
+            offset: 0,
+            len,
         })
     }
 
-    /// Moves the bytes into a temporary file inside `dir` and releases the
-    /// heap allocation, keeping the bytes readable through a memory mapping.
+    /// Returns a **zero-copy** sub-storage over `offset..offset + len` of
+    /// this storage's bytes.
     ///
-    /// This is the spill primitive: after the call, the storage's RAM is
-    /// returned to the system and reads go through the OS page cache. The
-    /// storage becomes read-only ([`Storage::as_bytes_mut`] returns `None`);
-    /// promote it back with [`Storage::make_mut`] if needed.
+    /// The slice shares the underlying allocation (an atomic increment, no
+    /// bytes moved). While any sharer is alive, neither storage is writable
+    /// in place — see the [module documentation](self).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + len` exceeds this storage's length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use datalab::storage::Storage;
+    ///
+    /// let storage = Storage::from_bytes(&[1, 2, 3, 4, 5]);
+    /// let window = storage.slice(1, 3);
+    /// assert_eq!(window.as_bytes(), &[2, 3, 4]);
+    /// ```
+    #[must_use]
+    pub fn slice(&self, offset: usize, len: usize) -> Self {
+        assert!(
+            offset.checked_add(len).is_some_and(|end| end <= self.len),
+            "slice {offset}..{} out of bounds of storage of length {}",
+            offset + len,
+            self.len
+        );
+        Self {
+            backing: Arc::clone(&self.backing),
+            offset: self.offset + offset,
+            len,
+        }
+    }
+
+    /// Moves the bytes into a temporary file inside `dir` and releases this
+    /// handle's reference to the heap allocation, keeping the bytes readable
+    /// through a memory mapping.
+    ///
+    /// This is the spill primitive: after the call, reads go through the OS
+    /// page cache and the storage is read-only ([`Storage::as_bytes_mut`]
+    /// returns `None`); promote it back with [`Storage::make_mut`] if
+    /// needed. Other storages sharing the old allocation are unaffected (the
+    /// RAM itself is returned to the system when the last sharer lets go).
     ///
     /// The temporary file is unlinked immediately after mapping, so it is
     /// reclaimed automatically when the storage is dropped (or on process
@@ -276,47 +341,50 @@ impl Storage {
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn spill_to_disk(&mut self, dir: impl AsRef<Path>) -> io::Result<()> {
-        match &self.backing {
-            Backing::Mmap(_) => Ok(()),
-            Backing::Heap { len: 0, .. } => Ok(()),
-            Backing::Heap { .. } => {
-                let id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = dir
-                    .as_ref()
-                    .join(format!("datalab-spill-{}-{id}", process::id()));
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)?;
-                file.write_all(self.as_bytes())?;
-                // SAFETY: read-only mapping of a file this process just wrote
-                // and, once unlinked below, no other process can reach.
-                let mmap = unsafe { Mmap::map(&file)? };
-                // Unlink now: on Unix the data lives until the mapping is
-                // dropped, and the file needs no manual cleanup. Best-effort:
-                // on platforms that forbid deleting an open file, it lingers
-                // until process exit.
-                let _ = fs::remove_file(&path);
-                self.backing = Backing::Mmap(mmap);
-                Ok(())
-            }
+        if matches!(&*self.backing, Backing::Mmap(_)) || self.len == 0 {
+            return Ok(());
         }
+        let id = SPILL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir
+            .as_ref()
+            .join(format!("datalab-spill-{}-{id}", process::id()));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(self.as_bytes())?;
+        // SAFETY: read-only mapping of a file this process just wrote and,
+        // once unlinked below, no other process can reach.
+        let mmap = unsafe { Mmap::map(&file)? };
+        // Unlink now: on Unix the data lives until the mapping is dropped,
+        // and the file needs no manual cleanup. Best-effort: on platforms
+        // that forbid deleting an open file, it lingers until process exit.
+        let _ = fs::remove_file(&path);
+        let len = mmap.len();
+        self.backing = Arc::new(Backing::Mmap(mmap));
+        self.offset = 0;
+        self.len = len;
+        Ok(())
     }
 
-    /// Returns `true` if the bytes can be mutated in place (heap backing).
+    /// Returns `true` if the bytes can be mutated in place: the storage is
+    /// heap-backed **and** not currently shared with any clone or slice.
     ///
     /// # Examples
     ///
     /// ```
     /// use datalab::storage::Storage;
     ///
-    /// assert!(Storage::zeroed(4).is_writable());
+    /// let storage = Storage::zeroed(4);
+    /// assert!(storage.is_writable());
+    /// let shared = storage.clone();
+    /// assert!(!storage.is_writable()); // shared until `shared` is dropped
     /// ```
     #[inline]
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        matches!(self.backing, Backing::Heap { .. })
+        Arc::strong_count(&self.backing) == 1 && matches!(&*self.backing, Backing::Heap { .. })
     }
 
     /// Returns the number of bytes held by this storage.
@@ -331,10 +399,7 @@ impl Storage {
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        match &self.backing {
-            Backing::Heap { len, .. } => *len,
-            Backing::Mmap(mmap) => mmap.len(),
-        }
+        self.len
     }
 
     /// Returns `true` if the storage holds no bytes.
@@ -350,15 +415,16 @@ impl Storage {
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 
-    /// Returns the alignment, in bytes, of the first byte.
+    /// Returns the guaranteed alignment, in bytes, of the first byte of this
+    /// storage's window.
     ///
-    /// For a heap storage this is the alignment the allocation was created
-    /// with. For a memory-mapped storage it is the actual alignment of the
-    /// mapped address (mappings are page-aligned, so this is at least the
-    /// page size — 4 KiB or more).
+    /// For a whole heap storage this is the alignment the allocation was
+    /// created with; for a memory-mapped one, the actual alignment of the
+    /// mapped address (page-aligned, so at least 4 KiB). Slicing at an
+    /// `offset` lowers the guarantee to the alignment of that offset.
     ///
     /// # Examples
     ///
@@ -369,13 +435,18 @@ impl Storage {
     /// ```
     #[must_use]
     pub fn alignment(&self) -> usize {
-        match &self.backing {
+        let base = match &*self.backing {
             Backing::Heap { align, .. } => *align,
             Backing::Mmap(mmap) => {
                 let addr = mmap.as_ptr() as usize;
                 debug_assert_ne!(addr, 0);
                 1 << addr.trailing_zeros()
             }
+        };
+        if self.offset == 0 {
+            base
+        } else {
+            base.min(1 << self.offset.trailing_zeros())
         }
     }
 
@@ -392,23 +463,23 @@ impl Storage {
     #[inline]
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        match &self.backing {
-            // SAFETY: `ptr` points to `len` contiguous, initialized bytes that
-            // stay valid and immutable for the lifetime of `&self`. For
-            // `len == 0`, a dangling pointer is a valid base for an empty
-            // slice.
-            Backing::Heap { ptr, len, .. } => unsafe {
-                slice::from_raw_parts(ptr.as_ptr(), *len)
+        match &*self.backing {
+            // SAFETY: the struct invariant guarantees `offset + len` lies
+            // within the allocation; the bytes are initialized and stay valid
+            // and immutable for the lifetime of `&self` (shared `Arc`). For
+            // an empty window, any base pointer is valid.
+            Backing::Heap { ptr, .. } => unsafe {
+                slice::from_raw_parts(ptr.as_ptr().add(self.offset), self.len)
             },
-            Backing::Mmap(mmap) => mmap,
+            Backing::Mmap(mmap) => &mmap[self.offset..self.offset + self.len],
         }
     }
 
     /// Returns a mutable view of the raw bytes, or `None` if the storage is
-    /// read-only (memory-mapped).
+    /// not writable in place (memory-mapped, or shared by a clone/slice).
     ///
-    /// Read-only storages never mutate silently: promote them explicitly with
-    /// [`Storage::make_mut`] instead.
+    /// Nothing mutates or copies silently: promote a non-writable storage
+    /// explicitly with [`Storage::make_mut`] instead.
     ///
     /// # Examples
     ///
@@ -422,66 +493,69 @@ impl Storage {
     #[inline]
     #[must_use]
     pub fn as_bytes_mut(&mut self) -> Option<&mut [u8]> {
-        match &mut self.backing {
-            Backing::Heap { ptr, len, .. } => {
-                // SAFETY: `ptr` points to `len` contiguous, initialized bytes
-                // that stay valid for the lifetime of `&mut self`, and
-                // `&mut self` guarantees exclusive access. For `len == 0`, a
-                // dangling pointer is valid.
-                let bytes = unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), *len) };
+        let offset = self.offset;
+        let len = self.len;
+        // `Arc::get_mut` returns `None` while the backing is shared — the
+        // copy-on-write gate.
+        match Arc::get_mut(&mut self.backing)? {
+            Backing::Heap { ptr, .. } => {
+                // SAFETY: the struct invariant guarantees `offset + len` lies
+                // within the allocation; `Arc::get_mut` proved exclusive
+                // access for the lifetime of `&mut self`. For an empty
+                // window, any base pointer is valid.
+                let bytes = unsafe { slice::from_raw_parts_mut(ptr.as_ptr().add(offset), len) };
                 Some(bytes)
             }
             Backing::Mmap(_) => None,
         }
     }
 
-    /// Ensures the storage is writable, then returns its mutable bytes.
+    /// Ensures the storage is uniquely writable, then returns its mutable
+    /// bytes.
     ///
-    /// If the storage is memory-mapped (read-only), its bytes are first
-    /// **copied** into a fresh heap allocation — an explicit `O(len)` cost,
-    /// after which the mapping is released. Heap storages are returned as-is.
+    /// If the storage is memory-mapped or shared, its window is first
+    /// **copied** into a fresh heap allocation — an explicit `O(len)`
+    /// copy-on-write, after which this handle owns the copy exclusively
+    /// (other sharers keep the original bytes). Uniquely-owned heap storages
+    /// are returned as-is.
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// use datalab::storage::Storage;
     ///
-    /// let mut storage = Storage::map_file("data.bin")?; // read-only
-    /// storage.make_mut()[0] = 42;                       // explicit copy, then write
-    /// assert!(storage.is_writable());
-    /// # Ok::<(), std::io::Error>(())
+    /// let mut storage = Storage::from_bytes(&[1, 2]);
+    /// let shared = storage.clone();
+    /// storage.make_mut()[0] = 9;            // explicit copy, then write
+    /// assert_eq!(storage.as_bytes(), &[9, 2]);
+    /// assert_eq!(shared.as_bytes(), &[1, 2]); // sharers keep the original
     /// ```
     pub fn make_mut(&mut self) -> &mut [u8] {
-        if let Backing::Mmap(_) = &self.backing {
-            let promoted = Self::from_bytes(self.as_bytes());
-            *self = promoted; // the mapping is dropped here
+        if !self.is_writable() {
+            *self = Self::from_bytes(self.as_bytes());
         }
         self.as_bytes_mut()
-            .expect("heap storage is always writable")
+            .expect("a uniquely-owned heap storage is writable")
     }
 }
 
 impl Clone for Storage {
-    /// Deep-copies the bytes into a new **heap** storage, so a clone is always
-    /// writable — even when cloning a memory-mapped storage.
+    /// **Zero-copy**: the clone shares the same bytes (an atomic increment).
+    /// While both are alive, neither is writable in place; mutate through
+    /// the explicit [`Storage::make_mut`]. See the
+    /// [module documentation](self).
     fn clone(&self) -> Self {
-        match &self.backing {
-            Backing::Heap { len, align, .. } => {
-                let mut cloned = Self::zeroed_aligned(*len, *align);
-                cloned
-                    .as_bytes_mut()
-                    .expect("freshly allocated heap storage is writable")
-                    .copy_from_slice(self.as_bytes());
-                cloned
-            }
-            Backing::Mmap(_) => Self::from_bytes(self.as_bytes()),
+        Self {
+            backing: Arc::clone(&self.backing),
+            offset: self.offset,
+            len: self.len,
         }
     }
 }
 
 impl PartialEq for Storage {
-    /// Two storages are equal when they hold the same bytes; backing and
-    /// alignment are not compared.
+    /// Two storages are equal when they hold the same bytes; backing,
+    /// sharing and alignment are not compared.
     fn eq(&self, other: &Self) -> bool {
         self.as_bytes() == other.as_bytes()
     }
@@ -497,13 +571,14 @@ impl Default for Storage {
 
 impl fmt::Debug for Storage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let backing = match &self.backing {
+        let backing = match &*self.backing {
             Backing::Heap { .. } => "heap",
             Backing::Mmap(_) => "mmap",
         };
         f.debug_struct("Storage")
             .field("backing", &backing)
-            .field("len", &self.len())
+            .field("len", &self.len)
+            .field("shared", &(Arc::strong_count(&self.backing) > 1))
             .finish()
     }
 }
@@ -583,13 +658,59 @@ mod tests {
     }
 
     #[test]
-    fn clone_is_a_deep_copy() {
-        let original = Storage::from_bytes(&[9, 8, 7]);
-        let mut copy = original.clone();
-        assert_eq!(copy, original);
-        copy.as_bytes_mut().unwrap()[0] = 0;
-        assert_ne!(copy, original);
-        assert_eq!(original.as_bytes(), &[9, 8, 7]);
+    fn clone_is_zero_copy_and_blocks_writes_while_shared() {
+        let mut storage = Storage::from_bytes(&[9, 8, 7]);
+        let shared = storage.clone();
+        // Same bytes, same underlying allocation.
+        assert_eq!(shared, storage);
+        assert_eq!(shared.as_bytes().as_ptr(), storage.as_bytes().as_ptr());
+        // Shared => neither handle is writable in place.
+        assert!(!storage.is_writable());
+        assert!(storage.as_bytes_mut().is_none());
+        // Dropping the sharer restores writability.
+        drop(shared);
+        assert!(storage.is_writable());
+        storage.as_bytes_mut().unwrap()[0] = 0;
+        assert_eq!(storage.as_bytes(), &[0, 8, 7]);
+    }
+
+    #[test]
+    fn make_mut_on_shared_storage_copies_on_write() {
+        let mut storage = Storage::from_bytes(&[1, 2]);
+        let shared = storage.clone();
+        storage.make_mut()[0] = 9;
+        assert_eq!(storage.as_bytes(), &[9, 2]);
+        assert_eq!(shared.as_bytes(), &[1, 2]); // the sharer is untouched
+        assert!(shared.is_writable()); // and unique again
+    }
+
+    #[test]
+    fn slice_is_zero_copy() {
+        let storage = Storage::from_bytes(&[1, 2, 3, 4, 5]);
+        let window = storage.slice(1, 3);
+        assert_eq!(window.as_bytes(), &[2, 3, 4]);
+        assert_eq!(
+            window.as_bytes().as_ptr(),
+            storage.as_bytes()[1..].as_ptr()
+        );
+        // A slice of a slice composes offsets.
+        let inner = window.slice(2, 1);
+        assert_eq!(inner.as_bytes(), &[4]);
+        // Empty slice at the end is fine.
+        assert!(storage.slice(5, 0).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn out_of_bounds_slice_panics() {
+        let _ = Storage::from_bytes(&[1, 2, 3]).slice(2, 2);
+    }
+
+    #[test]
+    fn slicing_lowers_the_alignment_guarantee() {
+        let storage = Storage::zeroed(64);
+        assert_eq!(storage.slice(0, 16).alignment(), STORAGE_ALIGN);
+        assert_eq!(storage.slice(8, 16).alignment(), 8);
     }
 
     #[test]
@@ -680,10 +801,12 @@ mod tests {
     }
 
     #[test]
-    fn make_mut_on_heap_storage_is_free() {
+    fn make_mut_on_unique_heap_storage_is_free() {
         let mut storage = Storage::from_bytes(&[5, 6]);
+        let before = storage.as_bytes().as_ptr();
         storage.make_mut()[1] = 7;
         assert_eq!(storage.as_bytes(), &[5, 7]);
+        assert_eq!(storage.as_bytes().as_ptr(), before); // no reallocation
     }
 
     #[test]
@@ -718,13 +841,12 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn clone_of_mapped_storage_is_writable() {
+    fn spill_of_shared_storage_leaves_sharers_untouched() {
         let mut storage = Storage::from_bytes(&[3, 1, 4]);
+        let shared = storage.clone();
         storage.spill_to_disk(std::env::temp_dir()).unwrap();
-        let mut clone = storage.clone();
-        assert!(clone.is_writable());
-        assert_eq!(clone, storage);
-        clone.as_bytes_mut().unwrap()[0] = 0;
         assert_eq!(storage.as_bytes(), &[3, 1, 4]);
+        assert!(shared.is_writable()); // the sharer became unique heap again
+        assert_eq!(shared.as_bytes(), &[3, 1, 4]);
     }
 }

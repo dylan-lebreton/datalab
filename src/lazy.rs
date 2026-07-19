@@ -548,12 +548,12 @@ fn batch_elems<T: Element>(batch_bytes: usize) -> usize {
 }
 
 /// Stream over a storage viewable as `[T]` (in-memory or memory-mapped):
-/// yields consecutive windows copied into fresh heap batches.
-///
-/// The copy per batch is deliberate for now (operators need owned input);
-/// borrowing windows zero-copy is a planned optimization.
+/// yields consecutive windows as **zero-copy slices** of the shared storage
+/// (no bytes are moved to produce a batch; downstream operators read the
+/// window and write into fresh outputs).
 struct StorageStream<T: Element> {
     storage: Storage,
+    /// Position in elements.
     pos: usize,
     batch_elems: usize,
     _elem: PhantomData<T>,
@@ -561,16 +561,16 @@ struct StorageStream<T: Element> {
 
 impl<T: Element> BatchStream for StorageStream<T> {
     fn next_batch(&mut self) -> Option<Batch> {
-        let view = View::<T>::new(&self.storage)
-            .expect("stream invariant: storage was validated at construction");
-        let slice = view.into_slice();
-        if self.pos >= slice.len() {
+        let total = self.storage.len() / size_of::<T>();
+        if self.pos >= total {
             return None;
         }
-        let end = (self.pos + self.batch_elems).min(slice.len());
-        let batch = Tensor::from_elements(&slice[self.pos..end]);
+        let end = (self.pos + self.batch_elems).min(total);
+        let window = self
+            .storage
+            .slice(self.pos * size_of::<T>(), (end - self.pos) * size_of::<T>());
         self.pos = end;
-        Some(Box::new(batch))
+        Some(Box::new(Tensor::<T>::from_storage(window)))
     }
 }
 

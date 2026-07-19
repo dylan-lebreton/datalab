@@ -90,9 +90,9 @@ pub enum ViewError {
         /// Alignment, in bytes, required by the element type.
         required: usize,
     },
-    /// The storage is read-only (e.g. memory-mapped), so no mutable view can
-    /// be created. Promote it first with
-    /// [`Storage::make_mut`](crate::storage::Storage::make_mut).
+    /// The storage is not writable in place (memory-mapped, or shared by a
+    /// clone/slice), so no mutable view can be created. Promote it first
+    /// with [`Storage::make_mut`](crate::storage::Storage::make_mut).
     ReadOnly,
 }
 
@@ -112,7 +112,7 @@ impl fmt::Display for ViewError {
             Self::ReadOnly => {
                 write!(
                     f,
-                    "storage is read-only (memory-mapped); promote it with Storage::make_mut"
+                    "storage is read-only (memory-mapped or shared); promote it with Storage::make_mut"
                 )
             }
         }
